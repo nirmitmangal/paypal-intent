@@ -1,0 +1,37 @@
+{
+  "name": "paypal-intent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-Powered Intention-Driven Commerce Agent for PayPal",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "npm --workspace=server run dev",
+    "dev:client": "npm --workspace=client run dev",
+    "build": "npm --workspace=shared run build && npm --workspace=server run build && npm --workspace=client run build",
+    "build:server": "npm --workspace=server run build",
+    "build:client": "npm --workspace=client run build",
+    "test": "npm --workspace=server run test && npm --workspace=client run test",
+    "typecheck": "npm --workspace=server run typecheck && npm --workspace=client run typecheck",
+    "verify:spec": "python scripts/verify_spec.py",
+    "verify:foundation": "python scripts/verify_foundation.py",
+    "verify:ui": "python scripts/verify_ui.py",
+    "verify:frontend": "python scripts/verify_frontend.py",
+    "verify:backend": "python scripts/verify_backend.py",
+    "verify:paypal": "python scripts/verify_paypal.py",
+    "verify:agent": "python scripts/verify_agent.py",
+    "verify:integration": "python scripts/verify_integration.py",
+    "verify:qa": "python scripts/verify_qa_security.py",
+    "verify:submission": "python scripts/verify_submission.py",
+    "verify:all": "python -c \"import subprocess, sys; [subprocess.run(['python', f'scripts/{s}'], check=True) for s in ['verify_spec.py','verify_foundation.py','verify_ui.py','verify_frontend.py','verify_backend.py','verify_paypal.py','verify_agent.py','verify_integration.py','verify_qa_security.py','verify_submission.py']]\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "author": "PayPal Intent Team",
+  "license": "MIT"
+}
