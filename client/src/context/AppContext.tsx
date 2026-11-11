@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import type { IntentSession, Product, TransactionRecord, ExecutionPlan } from '@paypal-intent/shared';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import type { IntentSession, Product, TransactionRecord, ExecutionPlan, ShoppingCart } from '@paypal-intent/shared';
 import { api, getStoredSessionToken } from '../lib/api';
 
 export type ScreenId =
@@ -38,7 +38,8 @@ interface AppContextType {
   navigateTo: (screen: ScreenId) => void;
   currentIntent: IntentSession | null;
   startIntent: (prompt: string, budget?: number, urgency?: string) => Promise<boolean>;
-  refineIntent: (refinementText: string) => Promise<void>;
+  refineIntent: (refinementText: string, updatedBudgetCeiling?: number) => Promise<void>;
+  updateIntentBudget: (newBudget: number) => Promise<boolean>;
   requirements: RequirementItem[];
   updateRequirement: (id: string, updates: Partial<RequirementItem>) => void;
   addRequirement: (req: Omit<RequirementItem, 'id'>) => void;
@@ -52,7 +53,7 @@ interface AppContextType {
   updateCartQuantity: (productId: string, quantity: number) => void;
   removeFromCart: (productId: string) => void;
   clearCart: () => void;
-  syncCartToServer: () => Promise<boolean>;
+  syncCartToServer: () => Promise<ShoppingCart | null>;
   comparedProducts: Product[];
   toggleCompare: (product: Product) => void;
   clearCompare: () => void;
@@ -64,6 +65,7 @@ interface AppContextType {
   transactions: TransactionRecord[];
   addTransaction: (tx: TransactionRecord) => void;
   catalogProducts: Product[];
+  refreshCatalog: () => Promise<void>;
   notifications: ToastNotification[];
   showNotification: (message: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
   dismissNotification: (id: string) => void;
@@ -77,8 +79,38 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 const CART_STORAGE_KEY = 'paypal_intent_cart_v1';
 const INTENT_STORAGE_KEY = 'paypal_intent_active_v1';
 
+const VALID_SCREENS: ScreenId[] = [
+  'home',
+  'workspace',
+  'planning',
+  'discovery',
+  'decision',
+  'cart',
+  'payment',
+  'history',
+  'settings',
+];
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const [activeScreen, setActiveScreen] = useState<ScreenId>('home');
+  const [activeScreen, setActiveScreen] = useState<ScreenId>(() => {
+    try {
+      const hash = window.location.hash.replace(/^#\/?/, '') as ScreenId;
+      if (VALID_SCREENS.includes(hash)) return hash;
+      const params = new URLSearchParams(window.location.search);
+      const screenParam = params.get('screen') as ScreenId;
+      if (VALID_SCREENS.includes(screenParam)) return screenParam;
+      // Handle direct pathnames (e.g. /payment, /history)
+      const pathSegment = window.location.pathname.replace(/^\//, '').split('/')[0] as ScreenId;
+      if (VALID_SCREENS.includes(pathSegment)) return pathSegment;
+      // If returning from PayPal Sandbox with order token or approval callback
+      if (params.has('token') || params.has('PayerID') || params.get('status') === 'approved') {
+        return 'payment';
+      }
+    } catch {
+      // ignore
+    }
+    return 'home';
+  });
   const [currentIntent, setCurrentIntent] = useState<IntentSession | null>(() => {
     try {
       const saved = localStorage.getItem(INTENT_STORAGE_KEY);
@@ -88,40 +120,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   });
 
-  const [requirements, setRequirements] = useState<RequirementItem[]>([
-    {
-      id: 'req_1',
-      name: 'Primary Audio / Recording Unit',
-      categoryId: 'microphone',
-      priority: 'essential',
-      budgetShare: 40,
-      description: 'Dynamic broadcast cardioid capsule with background noise rejection.',
-    },
-    {
-      id: 'req_2',
-      name: 'Acoustic Isolation & Monitoring',
-      categoryId: 'headphones',
-      priority: 'essential',
-      budgetShare: 25,
-      description: 'Closed-back reference headphones to eliminate monitor bleed.',
-    },
-    {
-      id: 'req_3',
-      name: 'Desk Suspension Mounting',
-      categoryId: 'boom_arm',
-      priority: 'recommended',
-      budgetShare: 20,
-      description: 'Heavy-duty articulated arm with internal cable channels.',
-    },
-    {
-      id: 'req_4',
-      name: 'Plosive Diffusion & Pop Shield',
-      categoryId: 'pop_filter',
-      priority: 'recommended',
-      budgetShare: 15,
-      description: 'Dual-layer metallic curved mesh for clean vocal captures.',
-    },
-  ]);
+  const [requirements, setRequirements] = useState<RequirementItem[]>([]);
 
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null);
   const [activeTier, setActiveTier] = useState<'budget' | 'balanced' | 'performance'>('balanced');
@@ -171,6 +170,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (txRes.success && txRes.data) {
           setTransactions(txRes.data);
         }
+        // Verify currentIntent still exists on server if present
+        if (currentIntent?.id) {
+          const intentCheck = await api.getIntent(currentIntent.id);
+          if (!intentCheck.success) {
+            setCurrentIntent(null);
+            localStorage.removeItem(INTENT_STORAGE_KEY);
+          }
+        }
       } catch (err) {
         console.error('Failed to load initial data:', err);
       }
@@ -178,8 +185,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     loadData();
   }, []);
 
+  const lastToastRef = useRef<{ message: string; timestamp: number } | null>(null);
+
   const showNotification = (message: string, type: ToastNotification['type'] = 'info') => {
-    const id = `toast_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const now = Date.now();
+    // Deduplicate identical notifications within 2.5 seconds to prevent spam
+    if (
+      lastToastRef.current &&
+      lastToastRef.current.message === message &&
+      now - lastToastRef.current.timestamp < 2500
+    ) {
+      return;
+    }
+    lastToastRef.current = { message, timestamp: now };
+
+    const id = `toast_${now}_${Math.random().toString(36).substring(2, 6)}`;
     setNotifications((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       dismissNotification(id);
@@ -192,11 +212,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const navigateTo = (screen: ScreenId) => {
     setActiveScreen(screen);
+    try {
+      if (window.location.hash.replace(/^#\/?/, '') !== screen) {
+        window.location.hash = screen === 'home' ? '' : screen;
+      }
+    } catch {
+      // ignore
+    }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const startIntent = async (prompt: string, budget = 350, urgency = 'standard'): Promise<boolean> => {
+  useEffect(() => {
+    const handleHash = () => {
+      const hash = window.location.hash.replace(/^#\/?/, '') as ScreenId;
+      if (VALID_SCREENS.includes(hash)) {
+        setActiveScreen(hash);
+      }
+    };
+    window.addEventListener('hashchange', handleHash);
+    return () => window.removeEventListener('hashchange', handleHash);
+  }, []);
+
+  const startIntent = async (prompt: string, budget?: number, urgency = 'standard'): Promise<boolean> => {
     setIsLoading(true);
+    setBundleItems([]);
+    setExecutionPlan(null);
+    setRequirements([]);
     try {
       const res = await api.createIntent(prompt, budget, currency, urgency);
       if (res.success && res.data) {
@@ -205,14 +246,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
         // Update requirements from server intelligence decomposition
         if ((res.data as any).requirements && Array.isArray((res.data as any).requirements)) {
-          const reqs = (res.data as any).requirements.map((r: any) => ({
-            id: r.id,
-            name: r.categoryName,
-            categoryId: r.categoryId,
-            priority: r.priority,
-            budgetShare: Math.round(r.estimatedBudgetShare * 100),
-            description: r.specConstraints ? JSON.stringify(r.specConstraints) : '',
-          }));
+          const reqs = (res.data as any).requirements.map((r: any) => {
+            let desc = r.description;
+            if (!desc && r.specConstraints) {
+              if (typeof r.specConstraints.description === 'string' && r.specConstraints.description.trim()) {
+                desc = r.specConstraints.description;
+              } else {
+                const keys = Object.keys(r.specConstraints).filter((k) => !k.startsWith('_') && k !== 'description');
+                desc = keys.length > 0 ? `${keys.map((k) => k.replace(/_/g, ' ')).join(', ')} optimized` : `${r.categoryName} component`;
+              }
+            }
+            return {
+              id: r.id,
+              name: r.categoryName,
+              categoryId: r.categoryId,
+              priority: r.priority,
+              budgetShare: Math.round(r.estimatedBudgetShare * 100),
+              description: desc || `${r.categoryName} component`,
+            };
+          });
           if (reqs.length > 0) {
             setRequirements(reqs);
           }
@@ -245,7 +297,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           sessionId: getStoredSessionToken() || 'ses_active',
           rawPrompt: prompt,
           parsedObjective: prompt.slice(0, 60),
-          budgetAmount: budget,
+          budgetAmount: budget ?? 300,
           budgetCurrency: currency,
           isHardCeiling: true,
           urgency: urgency as any,
@@ -266,24 +318,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const refineIntent = async (refinementText: string) => {
+  const refineIntent = async (refinementText: string, updatedBudgetCeiling?: number) => {
     if (!currentIntent) return;
     setIsLoading(true);
     try {
-      const res = await api.refineIntent(currentIntent.id, refinementText);
+      const res = await api.refineIntent(currentIntent.id, refinementText, updatedBudgetCeiling);
       if (res.success && res.data) {
         const updated = (res.data as any).intentSession || res.data;
         setCurrentIntent(updated);
 
         if ((res.data as any).requirements && Array.isArray((res.data as any).requirements)) {
-          const reqs = (res.data as any).requirements.map((r: any) => ({
-            id: r.id,
-            name: r.categoryName,
-            categoryId: r.categoryId,
-            priority: r.priority,
-            budgetShare: Math.round(r.estimatedBudgetShare * 100),
-            description: r.specConstraints ? JSON.stringify(r.specConstraints) : '',
-          }));
+          const reqs = (res.data as any).requirements.map((r: any) => {
+            let desc = r.description;
+            if (!desc && r.specConstraints) {
+              if (typeof r.specConstraints.description === 'string' && r.specConstraints.description.trim()) {
+                desc = r.specConstraints.description;
+              } else {
+                const keys = Object.keys(r.specConstraints).filter((k) => !k.startsWith('_') && k !== 'description');
+                desc = keys.length > 0 ? `${keys.map((k) => k.replace(/_/g, ' ')).join(', ')} optimized` : `${r.categoryName} component`;
+              }
+            }
+            return {
+              id: r.id,
+              name: r.categoryName,
+              categoryId: r.categoryId,
+              priority: r.priority,
+              budgetShare: Math.round(r.estimatedBudgetShare * 100),
+              description: desc || `${r.categoryName} component`,
+            };
+          });
           if (reqs.length > 0) {
             setRequirements(reqs);
           }
@@ -327,6 +390,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const updateIntentBudget = async (newBudget: number): Promise<boolean> => {
+    if (!currentIntent) return false;
+    setIsLoading(true);
+    try {
+      await refineIntent(`Adjust budget ceiling to $${newBudget}`, newBudget);
+      showNotification(`Budget ceiling adjusted to $${newBudget}. Proposal recalculating...`, 'success');
+      return true;
+    } catch (err) {
+      console.error('Failed to update budget:', err);
+      showNotification('Failed to update budget ceiling', 'error');
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const updateRequirement = (id: string, updates: Partial<RequirementItem>) => {
     setRequirements((prev) => prev.map((r) => (r.id === id ? { ...r, ...updates } : r)));
     showNotification('Requirement updated', 'info');
@@ -343,10 +422,80 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     showNotification('Requirement category removed', 'info');
   };
 
-  const handleSetActiveTier = (tier: 'budget' | 'balanced' | 'performance') => {
+  const handleSetActiveTier = async (tier: 'budget' | 'balanced' | 'performance') => {
     setActiveTier(tier);
+
+    // 1. Immediately update bundle items and cart from catalog for instant reactive UI
+    if (catalogProducts.length > 0) {
+      const kb =
+        catalogProducts.find((p) => p.id === (tier === 'performance' ? 'prod_kb_02' : 'prod_kb_03')) ||
+        catalogProducts.find((p) => p.categoryId?.toLowerCase().includes('keyboard'));
+      const mou =
+        catalogProducts.find((p) => p.id === (tier === 'performance' ? 'prod_mou_02' : 'prod_mou_01')) ||
+        catalogProducts.find((p) => p.categoryId?.toLowerCase().includes('mou'));
+      const lamp =
+        catalogProducts.find((p) => p.id === 'prod_acc_02') ||
+        catalogProducts.find((p) => p.title?.toLowerCase().includes('lamp') || p.categoryId?.toLowerCase().includes('accessories'));
+      const audio =
+        catalogProducts.find((p) => p.id === (tier === 'budget' ? 'prod_hp_03' : 'prod_hp_01')) ||
+        catalogProducts.find((p) => p.categoryId?.toLowerCase().includes('headphone'));
+
+      const immediateItems = [kb, mou, lamp, audio].filter(Boolean) as Product[];
+      if (immediateItems.length === 4) {
+        setBundleItems(immediateItems);
+        const newCartItems = immediateItems.map((p) => ({ product: p, quantity: 1 }));
+        setCartItems(newCartItems);
+        localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(newCartItems));
+      }
+    }
+
+    // 2. Authoritative server-side plan generation & cart synchronization
     if (currentIntent) {
-      generatePlan(tier);
+      await generatePlan(tier);
+    } else {
+      try {
+        setIsLoading(true);
+        const res = await api.createIntent(
+          'I need a keyboard, wireless mouse, desk lamp, and headphones under $300',
+          300,
+          'USD',
+          'standard'
+        );
+        if (res.success && res.data) {
+          const intentData = (res.data as any).intentSession || res.data;
+          setCurrentIntent(intentData);
+          if ((res.data as any).requirements && Array.isArray((res.data as any).requirements)) {
+            const reqs = (res.data as any).requirements.map((r: any) => ({
+              id: r.id,
+              name: r.categoryName,
+              categoryId: r.categoryId,
+              priority: r.priority,
+              budgetShare: Math.round(r.estimatedBudgetShare * 100),
+              description: r.description || `${r.categoryName} component`,
+            }));
+            setRequirements(reqs);
+          }
+          const planRes = await api.generatePlan(intentData.id, tier);
+          if (planRes.success && planRes.data) {
+            setExecutionPlan(planRes.data);
+            const items = planRes.data.items.map((i: any) => i.product).filter(Boolean) as Product[];
+            if (items.length > 0) {
+              setBundleItems(items);
+              const newCartItems = items.map((product) => ({ product, quantity: 1 }));
+              setCartItems(newCartItems);
+              localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(newCartItems));
+              await api.syncCart(
+                items.map((p) => ({ productId: p.id, quantity: 1 })),
+                intentData.id
+              );
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to auto-stage intent for tier selection:', err);
+      } finally {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -354,7 +503,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (!currentIntent) return;
     setIsLoading(true);
     try {
-      const res = await api.generatePlan(currentIntent.id, tier);
+      const mappedReqs = requirements.map((r) => ({
+        id: r.id,
+        categoryId: r.categoryId,
+        categoryName: r.name,
+        priority: r.priority,
+        estimatedBudgetShare: r.budgetShare / 100,
+        description: r.description,
+      }));
+      let res = await api.generatePlan(currentIntent.id, tier, mappedReqs);
+      if (!res.success && (res.error?.code === 'INTENT_NOT_FOUND' || res.error?.code === 'UNAUTHORIZED_ACCESS')) {
+        // Auto-recreate intent on server if stale from previous session
+        const createRes = await api.createIntent(
+          currentIntent.rawPrompt || 'I need a keyboard, wireless mouse, desk lamp, and headphones under $300',
+          currentIntent.budgetAmount || 300,
+          currentIntent.budgetCurrency || 'USD',
+          currentIntent.urgency || 'standard'
+        );
+        if (createRes.success && createRes.data) {
+          const newIntent = (createRes.data as any).intentSession || createRes.data;
+          setCurrentIntent(newIntent);
+          res = await api.generatePlan(newIntent.id, tier, mappedReqs);
+        }
+      }
+
       if (res.success && res.data) {
         setExecutionPlan(res.data);
         setActiveTier(tier);
@@ -362,6 +534,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const items = res.data.items.map((i) => i.product).filter(Boolean) as Product[];
         if (items.length > 0) {
           setBundleItems(items);
+          const newCartItems = items.map((product) => ({ product, quantity: 1 }));
+          setCartItems(newCartItems);
+          localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(newCartItems));
+          try {
+            await api.syncCart(
+              items.map((p) => ({ productId: p.id, quantity: 1 })),
+              currentIntent.id
+            );
+          } catch (syncErr) {
+            console.warn('Failed to sync tier bundle to server cart:', syncErr);
+          }
         }
       }
     } catch (err) {
@@ -371,16 +554,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const syncCartToServer = async (): Promise<boolean> => {
+  const refreshCatalog = async (): Promise<void> => {
+    try {
+      const prodRes = await api.getProducts();
+      if (prodRes.success && prodRes.data) {
+        setCatalogProducts(prodRes.data);
+        if (bundleItems.length === 0) {
+          setBundleItems(prodRes.data.slice(0, 4));
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh catalog:', err);
+    }
+  };
+
+  const syncCartToServer = async (): Promise<ShoppingCart | null> => {
     try {
       const items = cartItems.map((item) => ({
         productId: item.product.id,
         quantity: item.quantity,
       }));
-      await api.syncCart(items, currentIntent?.id);
-      return true;
+      const cart = await api.syncCart(items, currentIntent?.id);
+      return cart;
     } catch {
-      return false;
+      return null;
     }
   };
 
@@ -469,6 +666,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         currentIntent,
         startIntent,
         refineIntent,
+        updateIntentBudget,
         requirements,
         updateRequirement,
         addRequirement,
@@ -494,6 +692,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         transactions,
         addTransaction,
         catalogProducts,
+        refreshCatalog,
         notifications,
         showNotification,
         dismissNotification,

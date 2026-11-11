@@ -8,7 +8,7 @@
 [![SQLite: WAL](https://img.shields.io/badge/Database-SQLite%20WAL-003B57)](https://sqlite.org/)
 [![Inference: Ollama Local](https://img.shields.io/badge/AI-Ollama%20Local-black)](https://ollama.com/)
 [![PayPal: Orders v2 Sandbox](https://img.shields.io/badge/PayPal-Orders%20v2%20Sandbox-003087)](https://developer.paypal.com/)
-[![Tests: 107/107 Passed](https://img.shields.io/badge/Tests-107%2F107%20Passed-brightgreen)](server/tests)
+[![Tests: 125/125 Passed](https://img.shields.io/badge/Tests-125%2F125%20Passed-brightgreen)](server/tests)
 
 > *"Tell the system what you want to accomplish. Let AI handle the complexity of commerce while you remain in full control of every payment."*
 
@@ -46,7 +46,7 @@ The AI agent decomposes complex goals, discovers compatible products from a cura
 - **Authoritative Server-Side Pricing**: Client-supplied prices are discarded. Subtotals, 8% sales tax, and grand totals are calculated server-side in integer minor units (cents).
 - **Genuine PayPal Sandbox Integration**: Uses `@paypal/react-paypal-js` and the PayPal Orders v2 REST API (`api-m.sandbox.paypal.com`). Successful transactions are **never simulated**.
 - **Double-Spending Prevention**: Enforces database uniqueness on `paypal_order_id` and rejects replay capture attempts with `409 Conflict` (`DUPLICATE_CAPTURE_ATTEMPT`).
-- **Cryptographic Audit Trail**: Every captured payment generates an immutable record sealed with a tamper-evident **SHA-256 digital receipt seal**.
+- **Cryptographic Audit Trail**: Every captured payment generates an immutable record sealed with a tamper-evident **SHA-256 Snapshot Hash**.
 - **Dual-Engine AI Resilience**: Seamlessly operates with local **Ollama** (`qwen2.5:3b`) or an algorithmic deterministic fallback with **100% Truth-in-Labeling** (`isAiGenerated: false`).
 
 ---

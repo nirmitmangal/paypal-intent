@@ -52,7 +52,10 @@ coverage/
 playwright-report/
 test-results/
 
+# Agent & Skill Tooling
+.agent/
 
 data/*.db
 data/*.db-shm
 data/*.db-wal
+tmp_chrome_profile/

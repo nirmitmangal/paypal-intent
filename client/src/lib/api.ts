@@ -92,10 +92,10 @@ export const api = {
 
   // Planning, Multi-Tier Bundles & Rebalancing
   getPlansForIntent: (intentId: string) => request<ExecutionPlan[]>(`/plans/intent/${intentId}`),
-  generatePlan: (intentSessionId: string, preferredTier = "balanced") =>
+  generatePlan: (intentSessionId: string, preferredTier = "balanced", requirements?: any[]) =>
     request<ExecutionPlan>("/plans", {
       method: "POST",
-      body: JSON.stringify({ intentSessionId, preferredTier }),
+      body: JSON.stringify({ intentSessionId, preferredTier, requirements }),
     }),
   rebalancePlan: (
     planId: string,
@@ -184,16 +184,17 @@ export const api = {
       currency: string;
       isConfigured: boolean;
     }>("/payments/config"),
-  createPayPalOrder: (cartId: string) =>
+  createPayPalOrder: (cartId: string, forceNew = false) =>
     request<{
       paypalOrderId: string;
       orderId: string;
       orderNumber: string;
       totalAmount: number;
       currency: string;
+      reused?: boolean;
     }>("/payments/create-order", {
       method: "POST",
-      body: JSON.stringify({ cartId }),
+      body: JSON.stringify({ cartId, forceNew }),
     }),
   capturePayPalOrder: (paypalOrderId: string, orderId: string) =>
     request<{
@@ -208,4 +209,13 @@ export const api = {
   // Transaction Ledger & Receipts
   getTransactions: () => request<TransactionRecord[]>("/transactions"),
   getTransactionById: (id: string) => request<TransactionRecord>(`/transactions/${id}`),
+  verifyTransactionHash: (id: string) =>
+    request<{
+      id: string;
+      isValid: boolean;
+      transactionHash: string;
+      algorithm: string;
+      canonicalPayload: string;
+      verifiedAt: string;
+    }>(`/transactions/${id}/verify`),
 };

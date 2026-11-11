@@ -20,8 +20,8 @@ export const intentController = {
       // 1. Analyze and interpret purchasing goal via AI with deterministic fallback
       const parsedIntent = await intentParserService.parseIntent(prompt);
 
-      // Override budget or currency if explicitly supplied in the request body
-      if (budgetCeiling !== undefined && budgetCeiling > 0) {
+      // Only override budget if prompt didn't specify one or if client passed an explicit non-default budget
+      if (!parsedIntent.hasExplicitBudget && budgetCeiling !== undefined && budgetCeiling > 0) {
         parsedIntent.budget.amount = budgetCeiling;
       }
       if (currency) {

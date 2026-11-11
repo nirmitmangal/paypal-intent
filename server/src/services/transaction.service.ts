@@ -33,4 +33,8 @@ export const transactionService = {
   getTransactionsForSession: (sessionId: string): TransactionRecord[] => {
     return transactionRepository.getAllBySession(sessionId);
   },
+
+  verifyTransactionHash: (tx: TransactionRecord): boolean => {
+    return transactionRepository.verifyTransactionHash(tx);
+  },
 };

@@ -139,6 +139,13 @@ describe('Real PayPal Sandbox Payment Integration Tests', () => {
         expect(body.intent).toBe('CAPTURE');
         expect(body.purchase_units[0].amount.currency_code).toBe('USD');
         expect(body.purchase_units[0].amount.value).toBe('410.39'); // 379.99 + 8% tax
+        // Verify that application_context contains required return_url, cancel_url, and brand_name
+        expect(body.application_context).toBeDefined();
+        expect(body.application_context.return_url).toContain('/payment');
+        expect(body.application_context.cancel_url).toContain('/payment');
+        expect(body.application_context.user_action).toBe('PAY_NOW');
+        expect(body.application_context.brand_name).toBe('PayPal Intent Demo Store');
+        expect(init.headers['PayPal-Request-Id']).toBeDefined();
 
         return new Response(
           JSON.stringify({
@@ -383,10 +390,247 @@ describe('Real PayPal Sandbox Payment Integration Tests', () => {
       // Verify database updated order status to 'captured'
       const updatedOrder = orderRepository.getById(order.id);
       expect(updatedOrder?.status).toBe('captured');
+
+      // Verify SHA-256 snapshot hash verification endpoint
+      const verifyRes = await request(app)
+        .get(`/api/transactions/${tx.id}/verify`)
+        .set('x-session-token', session.sessionToken);
+      expect(verifyRes.status).toBe(200);
+      expect(verifyRes.body.success).toBe(true);
+      expect(verifyRes.body.data.isValid).toBe(true);
+      expect(verifyRes.body.data.algorithm).toBe('SHA-256');
     } finally {
       env.PAYPAL_CLIENT_ID = originalId;
       env.PAYPAL_CLIENT_SECRET = originalSecret;
       fetchSpy.mockRestore();
     }
+  });
+
+  // ==========================================================================
+  // 4. Idempotency, Deduplication & Error Diagnostics Tests
+  // ==========================================================================
+  it('idempotently reuses existing pending PayPal order without duplicate PayPal API calls', async () => {
+    const session = sessionRepository.getOrCreate();
+    const intent = intentRepository.create({
+      sessionId: session.id,
+      rawPrompt: 'Idempotency test setup',
+    });
+    const cart = cartRepository.getOrCreate(session.id, intent.id);
+    cartRepository.addItem(cart.id, 'prod_kb_01', 1);
+
+    const originalId = env.PAYPAL_CLIENT_ID;
+    const originalSecret = env.PAYPAL_CLIENT_SECRET;
+    env.PAYPAL_CLIENT_ID = 'test_mock_client_id';
+    env.PAYPAL_CLIENT_SECRET = 'test_mock_client_secret';
+
+    const testOrderId = `PP-IDEMPOTENT-${Date.now()}`;
+    let paypalApiCallCount = 0;
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/oauth2/token')) {
+        return new Response(JSON.stringify({ access_token: 'token_idem', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (urlStr.includes('/v2/checkout/orders')) {
+        paypalApiCallCount++;
+        return new Response(
+          JSON.stringify({ id: testOrderId, status: 'CREATED' }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not Found', { status: 404 });
+    });
+
+    try {
+      // First call: creates PayPal order
+      const res1 = await request(app)
+        .post('/api/payments/create-order')
+        .set('x-session-token', session.sessionToken)
+        .send({ cartId: cart.id })
+        .expect(201);
+
+      expect(res1.body.success).toBe(true);
+      expect(res1.body.data.paypalOrderId).toBe(testOrderId);
+      expect(res1.body.data.reused).toBe(false);
+      expect(paypalApiCallCount).toBe(1);
+
+      // Second consecutive call with same cart: must reuse existing order without calling PayPal API again
+      const res2 = await request(app)
+        .post('/api/payments/create-order')
+        .set('x-session-token', session.sessionToken)
+        .send({ cartId: cart.id })
+        .expect(201);
+
+      expect(res2.body.success).toBe(true);
+      expect(res2.body.data.paypalOrderId).toBe(testOrderId);
+      expect(res2.body.data.reused).toBe(true);
+      // PayPal API was NOT called a second time
+      expect(paypalApiCallCount).toBe(1);
+    } finally {
+      env.PAYPAL_CLIENT_ID = originalId;
+      env.PAYPAL_CLIENT_SECRET = originalSecret;
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('supports forceNew flag to regenerate PayPal order when explicitly requested', async () => {
+    const session = sessionRepository.getOrCreate();
+    const intent = intentRepository.create({
+      sessionId: session.id,
+      rawPrompt: 'Force new order test',
+    });
+    const cart = cartRepository.getOrCreate(session.id, intent.id);
+    cartRepository.addItem(cart.id, 'prod_mou_01', 1);
+
+    const originalId = env.PAYPAL_CLIENT_ID;
+    const originalSecret = env.PAYPAL_CLIENT_SECRET;
+    env.PAYPAL_CLIENT_ID = 'test_mock_client_id';
+    env.PAYPAL_CLIENT_SECRET = 'test_mock_client_secret';
+
+    let orderCounter = 0;
+    const testRunId = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/oauth2/token')) {
+        return new Response(JSON.stringify({ access_token: 'token_fn', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (urlStr.includes('/v2/checkout/orders')) {
+        orderCounter++;
+        return new Response(
+          JSON.stringify({ id: `PP-ORDER-${testRunId}-${orderCounter}`, status: 'CREATED' }),
+          { status: 201, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('Not Found', { status: 404 });
+    });
+
+    try {
+      const res1 = await request(app)
+        .post('/api/payments/create-order')
+        .set('x-session-token', session.sessionToken)
+        .send({ cartId: cart.id })
+        .expect(201);
+
+      expect(res1.body.data.paypalOrderId).toBe(`PP-ORDER-${testRunId}-1`);
+
+      // Call with forceNew: true generates a fresh order
+      const res2 = await request(app)
+        .post('/api/payments/create-order')
+        .set('x-session-token', session.sessionToken)
+        .send({ cartId: cart.id, forceNew: true })
+        .expect(201);
+
+      expect(res2.body.data.paypalOrderId).toBe(`PP-ORDER-${testRunId}-2`);
+      expect(orderCounter).toBe(2);
+    } finally {
+      env.PAYPAL_CLIENT_ID = originalId;
+      env.PAYPAL_CLIENT_SECRET = originalSecret;
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('rejects capture with 422 when PayPal reports ORDER_NOT_APPROVED with sanitized debug ID', async () => {
+    const session = sessionRepository.getOrCreate();
+    const intent = intentRepository.create({
+      sessionId: session.id,
+      rawPrompt: 'Unapproved order test',
+    });
+    const cart = cartRepository.getOrCreate(session.id, intent.id);
+    cartRepository.addItem(cart.id, 'prod_acc_02', 1);
+    const order = orderRepository.createFromCart(cart);
+
+    const originalId = env.PAYPAL_CLIENT_ID;
+    const originalSecret = env.PAYPAL_CLIENT_SECRET;
+    env.PAYPAL_CLIENT_ID = 'test_mock_client_id';
+    env.PAYPAL_CLIENT_SECRET = 'test_mock_client_secret';
+
+    const unapprovedOrderId = 'PP-UNAPPROVED-TEST';
+    const mockDebugId = 'debug_id_unapproved_abc123';
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/v1/oauth2/token')) {
+        return new Response(JSON.stringify({ access_token: 'token_unapp', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (urlStr.includes('/capture')) {
+        return new Response(
+          JSON.stringify({
+            name: 'UNPROCESSABLE_ENTITY',
+            details: [
+              {
+                issue: 'ORDER_NOT_APPROVED',
+                description: 'Payer has not yet approved the Order for payment.',
+              },
+            ],
+            message: 'Failed business validation.',
+            debug_id: mockDebugId,
+          }),
+          {
+            status: 422,
+            headers: {
+              'Content-Type': 'application/json',
+              'paypal-debug-id': mockDebugId,
+            },
+          }
+        );
+      }
+      return new Response('Not Found', { status: 404 });
+    });
+
+    try {
+      const res = await request(app)
+        .post('/api/payments/capture-order')
+        .set('x-session-token', session.sessionToken)
+        .send({ paypalOrderId: unapprovedOrderId, orderId: order.id })
+        .expect(422);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toBe('ORDER_NOT_APPROVED');
+      expect(res.body.error.message).toContain('ORDER_NOT_APPROVED');
+      expect(res.body.error.message).toContain(mockDebugId);
+
+      // Order must remain pending in DB
+      const dbOrder = orderRepository.getById(order.id);
+      expect(dbOrder?.status).toBe('pending');
+    } finally {
+      env.PAYPAL_CLIENT_ID = originalId;
+      env.PAYPAL_CLIENT_SECRET = originalSecret;
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('rejects order creation when cart exceeds hard budget ceiling (400 BUDGET_CEILING_EXCEEDED)', async () => {
+    const session = sessionRepository.getOrCreate();
+    const intent = intentRepository.create({
+      sessionId: session.id,
+      rawPrompt: 'College study desk',
+      budgetAmount: 300,
+      isHardCeiling: true,
+    });
+    const cart = cartRepository.getOrCreate(session.id, intent.id);
+    // Bundle totaling $307.76
+    cartRepository.addItem(cart.id, 'prod_kb_01', 1); // 89.99
+    cartRepository.addItem(cart.id, 'prod_mou_02', 1); // 49.99
+    cartRepository.addItem(cart.id, 'prod_acc_02', 1); // 44.99
+    cartRepository.addItem(cart.id, 'prod_hp_01', 1); // 99.99
+
+    const res = await request(app)
+      .post('/api/payments/create-order')
+      .set('x-session-token', session.sessionToken)
+      .send({ cartId: cart.id })
+      .expect(400);
+
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.code).toBe('BUDGET_CEILING_EXCEEDED');
+    expect(res.body.error.message).toContain('hard budget ceiling');
   });
 });

@@ -218,13 +218,18 @@ export const requirementRepository = {
     categoryName: string;
     priority?: RequirementPriority;
     estimatedBudgetShare?: number;
+    description?: string;
     specConstraints?: Record<string, unknown>;
   }): IntentRequirement => {
     const db = getDatabase();
     const id = `req_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
     const priority = params.priority || 'essential';
     const estimatedBudgetShare = params.estimatedBudgetShare ?? 0.0;
-    const specConstraints = params.specConstraints ? JSON.stringify(params.specConstraints) : null;
+    const specObj = {
+      description: params.description || '',
+      ...(params.specConstraints || {}),
+    };
+    const specConstraints = JSON.stringify(specObj);
 
     db.prepare(`
       INSERT INTO intent_requirements (id, intent_session_id, category_id, category_name, priority, estimated_budget_share, spec_constraints)
@@ -246,7 +251,8 @@ export const requirementRepository = {
       categoryName: params.categoryName,
       priority,
       estimatedBudgetShare,
-      specConstraints: params.specConstraints || {},
+      description: params.description || '',
+      specConstraints: specObj,
       createdAt: new Date().toISOString(),
     };
   },
@@ -258,6 +264,7 @@ export const requirementRepository = {
       categoryName: string;
       priority?: RequirementPriority;
       estimatedBudgetShare?: number;
+      description?: string;
       specConstraints?: Record<string, unknown>;
     }>
   ): IntentRequirement[] => {
@@ -274,7 +281,11 @@ export const requirementRepository = {
       const id = `req_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
       const priority = req.priority || 'essential';
       const estimatedBudgetShare = req.estimatedBudgetShare ?? 0.0;
-      const specConstraints = req.specConstraints ? JSON.stringify(req.specConstraints) : null;
+      const specObj = {
+        description: req.description || '',
+        ...(req.specConstraints || {}),
+      };
+      const specConstraints = JSON.stringify(specObj);
 
       insertStmt.run(
         id,
@@ -293,7 +304,8 @@ export const requirementRepository = {
         categoryName: req.categoryName,
         priority,
         estimatedBudgetShare,
-        specConstraints: req.specConstraints || {},
+        description: req.description || '',
+        specConstraints: specObj,
         createdAt: new Date().toISOString(),
       });
     }
@@ -307,16 +319,21 @@ export const requirementRepository = {
       .prepare('SELECT * FROM intent_requirements WHERE intent_session_id = ? ORDER BY estimated_budget_share DESC')
       .all(intentSessionId) as any[];
 
-    return rows.map((r) => ({
-      id: r.id,
-      intentSessionId: r.intent_session_id,
-      categoryId: r.category_id,
-      categoryName: r.category_name,
-      priority: r.priority,
-      estimatedBudgetShare: r.estimated_budget_share,
-      specConstraints: r.spec_constraints ? JSON.parse(r.spec_constraints) : {},
-      createdAt: r.created_at,
-    }));
+    return rows.map((r) => {
+      const parsedSpecs = r.spec_constraints ? JSON.parse(r.spec_constraints) : {};
+      const description = parsedSpecs.description || parsedSpecs._description || `${r.category_name} requirement`;
+      return {
+        id: r.id,
+        intentSessionId: r.intent_session_id,
+        categoryId: r.category_id,
+        categoryName: r.category_name,
+        priority: r.priority,
+        estimatedBudgetShare: r.estimated_budget_share,
+        description,
+        specConstraints: parsedSpecs,
+        createdAt: r.created_at,
+      };
+    });
   },
 
   deleteByIntentId: (intentSessionId: string): void => {
@@ -421,6 +438,12 @@ export const planRepository = {
       .prepare('SELECT * FROM recommendations WHERE execution_plan_id = ?')
       .all(planRow.id) as any[];
 
+    const intentRow = db.prepare('SELECT * FROM intent_sessions WHERE id = ?').get(planRow.intent_session_id) as any;
+    const isHardCeiling = intentRow ? intentRow.is_hard_ceiling === 1 : false;
+    const budgetAmount = intentRow ? intentRow.budget_amount : 0;
+    const isFeasible = !isHardCeiling || budgetAmount <= 0 || planRow.total_estimated_cost <= budgetAmount;
+    const budgetDeficit = !isFeasible && intentRow ? Math.round((planRow.total_estimated_cost - budgetAmount) * 100) / 100 : 0;
+
     return {
       id: planRow.id,
       intentSessionId: planRow.intent_session_id,
@@ -430,6 +453,8 @@ export const planRepository = {
       isActive: planRow.is_active === 1,
       totalEstimatedCost: planRow.total_estimated_cost,
       currency: planRow.currency,
+      isFeasible,
+      budgetDeficit,
       items: itemRows.map((r) => ({
         id: r.id,
         executionPlanId: r.execution_plan_id,
@@ -682,13 +707,52 @@ export const cartRepository = {
     return null;
   },
 
-  getOrCreate: (sessionId: string, intentSessionId: string): ShoppingCart => {
+  getOrCreate: (sessionId: string, intentSessionId?: string): ShoppingCart => {
     const db = getDatabase();
+
+    // 1. Resolve a valid, persisted intent session ID to strictly satisfy SQLite FK constraint
+    let validIntentId: string | null = null;
+    if (intentSessionId && intentSessionId.trim()) {
+      const intentRow = db
+        .prepare('SELECT id FROM intent_sessions WHERE id = ?')
+        .get(intentSessionId.trim()) as { id: string } | undefined;
+      if (intentRow) {
+        validIntentId = intentRow.id;
+      }
+    }
+
+    if (!validIntentId) {
+      // Find latest intent belonging to this session
+      const sessionIntent = db
+        .prepare('SELECT id FROM intent_sessions WHERE session_id = ? ORDER BY created_at DESC LIMIT 1')
+        .get(sessionId) as { id: string } | undefined;
+      if (sessionIntent) {
+        validIntentId = sessionIntent.id;
+      }
+    }
+
+    if (!validIntentId) {
+      // Auto-provision default intent for this session in SQLite so foreign key constraint is satisfied
+      const defaultIntent = intentRepository.create({
+        sessionId,
+        rawPrompt: 'Study desk setup: keyboard, wireless mouse, desk lamp, and headphones under $300',
+        parsedObjective: 'Study desk setup',
+        budgetAmount: 300,
+        budgetCurrency: 'USD',
+        isHardCeiling: true,
+        urgency: 'standard',
+      });
+      validIntentId = defaultIntent.id;
+    }
+
     const existing = db
       .prepare("SELECT * FROM shopping_carts WHERE session_id = ? AND status = 'active'")
       .get(sessionId) as any;
 
     if (existing) {
+      if (validIntentId && existing.intent_session_id !== validIntentId) {
+        db.prepare('UPDATE shopping_carts SET intent_session_id = ? WHERE id = ?').run(validIntentId, existing.id);
+      }
       return cartRepository.getWithItems(existing.id);
     }
 
@@ -696,12 +760,12 @@ export const cartRepository = {
     db.prepare(`
       INSERT INTO shopping_carts (id, session_id, intent_session_id, status, subtotal, estimated_tax, shipping_fee, total_amount, currency)
       VALUES (?, ?, ?, 'active', 0.0, 0.0, 0.0, 0.0, 'USD')
-    `).run(id, sessionId, intentSessionId);
+    `).run(id, sessionId, validIntentId);
 
     return {
       id,
       sessionId,
-      intentSessionId,
+      intentSessionId: validIntentId,
       status: 'active',
       subtotal: 0,
       estimatedTax: 0,
@@ -892,6 +956,8 @@ export const cartRepository = {
     errors: string[];
     warnings: string[];
     cart: ShoppingCart;
+    isOverBudget?: boolean;
+    budgetDeficit?: number;
   } => {
     const cart = cartRepository.getWithItems(cartId);
     const errors: string[] = [];
@@ -942,11 +1008,30 @@ export const cartRepository = {
     }
 
     const updatedCart = cartRepository.getWithItems(cartId);
+
+    // Hard Budget Ceiling Enforcement
+    let isOverBudget = false;
+    let budgetDeficit = 0;
+    if (updatedCart.intentSessionId) {
+      const intentRow = db.prepare('SELECT * FROM intent_sessions WHERE id = ?').get(updatedCart.intentSessionId) as any;
+      if (intentRow && intentRow.is_hard_ceiling === 1 && intentRow.budget_amount > 0) {
+        if (updatedCart.totalAmount > intentRow.budget_amount) {
+          isOverBudget = true;
+          budgetDeficit = Math.round((updatedCart.totalAmount - intentRow.budget_amount) * 100) / 100;
+          errors.push(
+            `Cart total ($${updatedCart.totalAmount.toFixed(2)}) exceeds hard budget ceiling ($${intentRow.budget_amount.toFixed(2)}) by $${budgetDeficit.toFixed(2)}.`
+          );
+        }
+      }
+    }
+
     return {
       isValid: errors.length === 0,
       errors,
       warnings,
       cart: updatedCart,
+      isOverBudget,
+      budgetDeficit,
     };
   },
 };
@@ -1086,8 +1171,9 @@ export const transactionRepository = {
     const feeAmount = params.feeAmount ?? Money.fromCents(Math.round(Money.toCents(params.grossAmount) * 0.0349 + 49));
     const netAmount = params.netAmount ?? Money.fromCents(Money.toCents(params.grossAmount) - Money.toCents(feeAmount));
 
-    // Generate cryptographic SHA-256 digital receipt seal
-    const timestamp = new Date().toISOString();
+    // Generate canonical SHA-256 snapshot hash
+    const timestamp = (params.auditSnapshot as any)?.hashTimestamp || (params.auditSnapshot as any)?.timestamp || new Date().toISOString();
+    (params.auditSnapshot as any).hashTimestamp = timestamp;
     const hashData = `${params.orderId}:${params.paymentId}:${params.grossAmount}:${params.sessionId}:${timestamp}`;
     const transactionHash = crypto.createHash('sha256').update(hashData).digest('hex');
 
@@ -1168,5 +1254,14 @@ export const transactionRepository = {
       auditSnapshot: JSON.parse(r.audit_snapshot),
       createdAt: r.created_at,
     }));
+  },
+
+  verifyTransactionHash: (tx: TransactionRecord): boolean => {
+    const audit = tx.auditSnapshot as any;
+    const timestamp = audit?.hashTimestamp || audit?.timestamp;
+    if (!timestamp) return false;
+    const hashData = `${tx.orderId}:${tx.paymentId}:${tx.grossAmount}:${tx.sessionId}:${timestamp}`;
+    const expected = crypto.createHash('sha256').update(hashData).digest('hex');
+    return expected === tx.transactionHash;
   },
 };

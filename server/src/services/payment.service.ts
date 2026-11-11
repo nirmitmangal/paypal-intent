@@ -73,9 +73,14 @@ export const paymentService = {
   },
 
   /**
-   * Creates an official PayPal Sandbox Order v2
+   * Creates an official PayPal Sandbox Order v2 with authoritative DB pricing,
+   * idempotency protection, and full application_context (return_url/cancel_url).
    */
-  createOrder: async (cartId: string, sessionId?: string): Promise<{ paypalOrderId: string; order: Order }> => {
+  createOrder: async (
+    cartId: string,
+    sessionId?: string,
+    forceNew = false
+  ): Promise<{ paypalOrderId: string; order: Order; reused?: boolean }> => {
     const cart = cartRepository.getWithItems(cartId);
     if (!cart || cart.items.length === 0) {
       const err = new Error('Cannot create order for an empty cart');
@@ -93,8 +98,10 @@ export const paymentService = {
     // Validate cart items against database catalog and authoritative prices
     const validation = cartRepository.validateCart(cartId);
     if (!validation.isValid) {
+      const isBudgetExceeded = validation.errors.some((e) => e.toLowerCase().includes('exceeds hard budget ceiling'));
       const err = new Error(`Cart validation failed: ${validation.errors.join('; ')}`);
-      (err as any).code = 'CART_INVALID';
+      (err as any).code = isBudgetExceeded ? 'BUDGET_CEILING_EXCEEDED' : 'CART_INVALID';
+      (err as any).statusCode = 400;
       throw err;
     }
 
@@ -124,12 +131,50 @@ export const paymentService = {
         createdAt: existingOrder.created_at,
         updatedAt: existingOrder.updated_at,
       };
+
+      // Keep order pricing synchronized with fresh cart calculation
+      if (
+        Math.abs(order.totalAmount - freshCart.totalAmount) > 0.01 ||
+        Math.abs(order.subtotal - freshCart.subtotal) > 0.01 ||
+        Math.abs(order.taxAmount - freshCart.estimatedTax) > 0.01
+      ) {
+        order.subtotal = freshCart.subtotal;
+        order.taxAmount = freshCart.estimatedTax;
+        order.totalAmount = freshCart.totalAmount;
+        db.prepare(
+          "UPDATE orders SET subtotal = ?, tax_amount = ?, total_amount = ?, updated_at = datetime('now') WHERE id = ?"
+        ).run(order.subtotal, order.taxAmount, order.totalAmount, order.id);
+      }
     } else {
       order = orderRepository.createFromCart(freshCart);
     }
 
-    // Call PayPal Orders v2 API with idempotency header
+    // Check if an active created payment already exists for this order
+    const existingPayment = db
+      .prepare("SELECT * FROM payments WHERE order_id = ? AND status = 'created' ORDER BY created_at DESC LIMIT 1")
+      .get(order.id) as any;
+
+    // Reuse existing pending PayPal Sandbox order if amounts match and forceNew is not requested
+    if (
+      !forceNew &&
+      existingPayment &&
+      existingPayment.paypal_order_id &&
+      Math.abs(existingPayment.amount - order.totalAmount) < 0.01
+    ) {
+      logger.info(
+        `Reusing existing active PayPal Sandbox order "${existingPayment.paypal_order_id}" for internal order "${order.id}" (idempotent)`
+      );
+      return {
+        paypalOrderId: existingPayment.paypal_order_id,
+        order,
+        reused: true,
+      };
+    }
+
+    // Call PayPal Orders v2 API with idempotency header and return/cancel URLs
     const token = await paymentService.getAccessToken();
+    const clientUrl = env.CLIENT_URL || 'http://localhost:3000';
+
     const orderPayload = {
       intent: 'CAPTURE',
       purchase_units: [
@@ -167,32 +212,61 @@ export const paymentService = {
         brand_name: 'PayPal Intent Demo Store',
         landing_page: 'NO_PREFERENCE',
         user_action: 'PAY_NOW',
+        return_url: `${clientUrl}/payment?status=approved`,
+        cancel_url: `${clientUrl}/payment?status=cancelled`,
       },
     };
+
+    const requestId = `order_${order.id}_${Math.round(order.totalAmount * 100)}`;
 
     const res = await fetch(`${env.PAYPAL_API_BASE}/v2/checkout/orders`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'PayPal-Request-Id': `order_${order.id}`,
+        'PayPal-Request-Id': requestId,
       },
       body: JSON.stringify(orderPayload),
     });
 
+    const debugId = res.headers.get('paypal-debug-id') || 'none';
+
     if (!res.ok) {
       const errorText = await res.text();
-      logger.error(`PayPal Order creation failed (${res.status}): ${errorText}`);
-      throw new Error(`PayPal Order creation failed (${res.status}): ${errorText}`);
+      let errorJson: any = null;
+      try {
+        errorJson = JSON.parse(errorText);
+      } catch {
+        // raw text response
+      }
+
+      const issue = errorJson?.details?.[0]?.issue || errorJson?.name || 'ORDER_CREATION_FAILED';
+      const description = errorJson?.details?.[0]?.description || errorJson?.message || errorText;
+      const sanitizedDiag = {
+        httpStatus: res.status,
+        name: errorJson?.name || 'ORDER_CREATION_FAILED',
+        issue,
+        description,
+        debugId,
+        orderId: order.id,
+      };
+      logger.error(`PayPal Order creation failed: ${JSON.stringify(sanitizedDiag)}`);
+
+      const err = new Error(
+        `PayPal Order creation failed (${res.status} ${issue}): ${description} [Debug ID: ${debugId}]`
+      );
+      (err as any).statusCode = res.status;
+      (err as any).code = issue;
+      (err as any).debugId = debugId;
+      throw err;
     }
 
     const paypalOrder = (await res.json()) as { id: string };
+    logger.info(
+      `PayPal Sandbox order created successfully: ${paypalOrder.id} [Debug ID: ${debugId}, Request ID: ${requestId}]`
+    );
 
     // Persist pending payment record in DB
-    const existingPayment = db
-      .prepare('SELECT id FROM payments WHERE order_id = ?')
-      .get(order.id) as { id: string } | undefined;
-
     if (!existingPayment) {
       const paymentId = `pay_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
       db.prepare(`
@@ -202,14 +276,15 @@ export const paymentService = {
     } else {
       db.prepare(`
         UPDATE payments
-        SET paypal_order_id = ?, status = 'created', updated_at = datetime('now')
+        SET paypal_order_id = ?, status = 'created', amount = ?, currency = ?, updated_at = datetime('now')
         WHERE id = ?
-      `).run(paypalOrder.id, existingPayment.id);
+      `).run(paypalOrder.id, order.totalAmount, order.currency, existingPayment.id);
     }
 
     return {
       paypalOrderId: paypalOrder.id,
       order,
+      reused: false,
     };
   },
 
@@ -263,24 +338,56 @@ export const paymentService = {
     // 5. Execute PayPal capture against official Sandbox API
     const token = await paymentService.getAccessToken();
     const captureUrl = `${env.PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}/capture`;
+    const requestId = `cap_${order.id}`;
 
-    logger.info(`Executing PayPal capture at: ${captureUrl} for order ${orderId}`);
+    logger.info(`Executing PayPal capture at: ${captureUrl} for order ${orderId} (PayPal Order: ${paypalOrderId})`);
     const res = await fetch(captureUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'PayPal-Request-Id': `cap_${order.id}`,
+        'PayPal-Request-Id': requestId,
       },
     });
 
+    const debugId = res.headers.get('paypal-debug-id') || 'none';
+
     if (!res.ok) {
       const errText = await res.text();
-      logger.error(`PayPal Sandbox capture failed (${res.status}): ${errText}`);
-      throw new Error(`PayPal Sandbox capture failed (${res.status}): ${errText}`);
+      let errJson: any = null;
+      try {
+        errJson = JSON.parse(errText);
+      } catch {
+        // raw text
+      }
+
+      const issue = errJson?.details?.[0]?.issue || errJson?.name || 'CAPTURE_FAILED';
+      const description = errJson?.details?.[0]?.description || errJson?.message || errText;
+
+      const sanitizedDiag = {
+        httpStatus: res.status,
+        name: errJson?.name || 'CAPTURE_ERROR',
+        issue,
+        description,
+        debugId,
+        orderId,
+        paypalOrderId,
+      };
+      logger.error(`PayPal Sandbox capture failed: ${JSON.stringify(sanitizedDiag)}`);
+
+      const err = new Error(
+        `PayPal Sandbox capture failed (${res.status} ${issue}): ${description} [Debug ID: ${debugId}]`
+      );
+      (err as any).statusCode = res.status;
+      (err as any).code = issue;
+      (err as any).debugId = debugId;
+      throw err;
     }
 
     const captureData = (await res.json()) as any;
+    logger.info(
+      `PayPal Sandbox capture succeeded for order ${orderId} (PayPal Order: ${paypalOrderId}) [Debug ID: ${debugId}]`
+    );
 
     // 6. Verify the capture response indicates actual successful payment
     const captureStatus = captureData.status;

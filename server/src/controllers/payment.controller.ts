@@ -3,6 +3,7 @@ import { paymentService } from '../services/payment.service';
 import { transactionService } from '../services/transaction.service';
 import { orderRepository, cartRepository } from '../db/repository';
 import { env } from '../config/env';
+import { logger } from '../utils/logger';
 
 export const paymentController = {
   getConfig: (_req: Request, res: Response): void => {
@@ -27,7 +28,7 @@ export const paymentController = {
   createOrder: async (req: Request, res: Response): Promise<void> => {
     try {
       const sessionId = (req as any).sessionId || 'ses_default';
-      const { cartId } = req.body;
+      const { cartId, forceNew } = req.body;
 
       if (!cartId || typeof cartId !== 'string') {
         res.status(400).json({
@@ -37,7 +38,7 @@ export const paymentController = {
         return;
       }
 
-      const result = await paymentService.createOrder(cartId, sessionId);
+      const result = await paymentService.createOrder(cartId, sessionId, Boolean(forceNew));
 
       res.status(201).json({
         success: true,
@@ -47,10 +48,12 @@ export const paymentController = {
           orderNumber: result.order.orderNumber,
           totalAmount: result.order.totalAmount,
           currency: result.order.currency,
+          reused: Boolean(result.reused),
         },
       });
     } catch (err) {
       const error = err as any;
+      logger.error(`createOrder failed: ${error.message}`);
       const status =
         error.statusCode ||
         (error.message?.includes('Unauthorized')
@@ -63,7 +66,7 @@ export const paymentController = {
 
       res.status(status).json({
         success: false,
-        error: { code: error.code || 'ORDER_CREATION_FAILED', message: error.message },
+        error: { code: error.code || 'ORDER_CREATION_FAILED', message: error.message, debugId: error.debugId },
       });
     }
   },
@@ -104,6 +107,7 @@ export const paymentController = {
       });
     } catch (err) {
       const error = err as any;
+      logger.error(`captureOrder failed: ${error.message}`);
       const status =
         error.statusCode ||
         (error.message?.includes('already')

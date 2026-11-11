@@ -126,8 +126,8 @@ However, **agentic commerce cannot succeed without trust**. Consumers will never
 
 - **Frontend**: React 18, TypeScript, Vite, Tailwind CSS, Lucide React, `@paypal/react-paypal-js`
 - **Backend**: Node.js, Express, TypeScript, TSX, Zod, UUID
-- **Database**: SQLite, `better-sqlite3`, Write-Ahead Logging (WAL)
+- **Database**: SQLite (`node:sqlite` DatabaseSync), Write-Ahead Logging (WAL)
 - **AI Inference**: Ollama (`qwen2.5:3b`), Local Open Weights
 - **Payments**: PayPal REST Orders v2 API, PayPal Sandbox
-- **Testing**: Vitest, React Testing Library, Supertest (107 automated tests)
-- **Security**: Cryptographic SHA-256 Digital Receipts, IDOR guards, Integer Minor-Unit Math
+- **Testing**: Vitest, React Testing Library, Supertest (125 automated tests passed)
+- **Security**: Cryptographic SHA-256 Snapshot Hash, IDOR guards, Integer Minor-Unit Math

@@ -9,34 +9,7 @@ export const cartController = {
       const sessionId = (req as any).sessionId || 'ses_default';
       const intentSessionId = (req.query.intentSessionId as string) || '';
 
-      let cart: ShoppingCart;
-      const activeCart = cartRepository.getActiveCartBySessionId(sessionId);
-      if (activeCart) {
-        cart = activeCart;
-      } else if (intentSessionId) {
-        cart = cartService.getCart(sessionId, intentSessionId);
-      } else {
-        // Return empty structure when no cart or intent exists yet
-        res.json({
-          success: true,
-          data: {
-            id: `crt_${sessionId.slice(0, 12)}`,
-            sessionId,
-            intentSessionId: '',
-            status: 'active',
-            subtotal: 0,
-            estimatedTax: 0,
-            shippingFee: 0,
-            totalAmount: 0,
-            currency: 'USD',
-            items: [],
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          },
-          meta: { timestamp: new Date().toISOString() },
-        });
-        return;
-      }
+      const cart = cartRepository.getOrCreate(sessionId, intentSessionId);
 
       const response: ApiResponse<ShoppingCart> = {
         success: true,

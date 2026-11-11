@@ -7,7 +7,7 @@ export const planController = {
   createPlan: async (req: Request, res: Response): Promise<void> => {
     try {
       const sessionId = (req as any).sessionId || 'ses_default';
-      const { intentSessionId, preferredTier } = req.body;
+      const { intentSessionId, preferredTier, requirements } = req.body;
       if (!intentSessionId) {
         res.status(400).json({
           success: false,
@@ -16,7 +16,14 @@ export const planController = {
         return;
       }
 
-      const intent = intentRepository.getById(intentSessionId);
+      let intent = intentRepository.getById(intentSessionId);
+      if (!intent) {
+        const sessionIntents = intentRepository.getBySessionId(sessionId);
+        if (sessionIntents.length > 0) {
+          intent = sessionIntents[0];
+        }
+      }
+
       if (!intent) {
         res.status(404).json({
           success: false,
@@ -33,7 +40,11 @@ export const planController = {
         return;
       }
 
-      const plan = await agentPlanningService.createPlanForIntent(intentSessionId, preferredTier || 'balanced');
+      const plan = await agentPlanningService.createPlanForIntent(
+        intent.id,
+        preferredTier || 'balanced',
+        requirements
+      );
 
       const response: ApiResponse<ExecutionPlan> = {
         success: true,

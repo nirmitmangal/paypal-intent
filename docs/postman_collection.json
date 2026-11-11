@@ -1,0 +1,309 @@
+{
+  "info": {
+    "_postman_id": "a9840243-d34e-4e4b-b0b1-paypal-intent-collection",
+    "name": "PayPal Intent API - Hackathon Submission Collection",
+    "description": "Postman Collection for PayPal Intent: Intention-driven agentic commerce platform integrating local Ollama AI and PayPal Orders v2 Sandbox.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000/api",
+      "type": "string"
+    },
+    {
+      "key": "sessionToken",
+      "value": "ses_postman_demo_token",
+      "type": "string"
+    },
+    {
+      "key": "cartId",
+      "value": "cart_demo_staging",
+      "type": "string"
+    },
+    {
+      "key": "intentId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "transactionId",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "01. Diagnostics & Health",
+      "item": [
+        {
+          "name": "System Health Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Verifies that Express, SQLite, and Ollama subsystem statuses are reporting healthy."
+          }
+        },
+        {
+          "name": "PayPal Gateway Config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/payments/config",
+              "host": ["{{baseUrl}}"],
+              "path": ["payments", "config"]
+            },
+            "description": "Returns public client configuration without exposing server credentials."
+          }
+        }
+      ]
+    },
+    {
+      "name": "02. Catalog & Discovery",
+      "item": [
+        {
+          "name": "List All Catalog Products",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/products",
+              "host": ["{{baseUrl}}"],
+              "path": ["products"]
+            },
+            "description": "Retrieves authoritative product catalog with verified SKUs, prices, categories, and inventory."
+          }
+        },
+        {
+          "name": "Get Catalog Category Summaries",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/products/categories",
+              "host": ["{{baseUrl}}"],
+              "path": ["products", "categories"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "03. AI Intent & Combinatorial Planning",
+      "item": [
+        {
+          "name": "Create Natural Language Shopping Intent",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"prompt\": \"I am a college student who wants a productive study desk setup: keyboard, wireless mouse, desk lamp, and headphones under $300\",\n  \"budgetCeiling\": 300,\n  \"currency\": \"USD\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/intents",
+              "host": ["{{baseUrl}}"],
+              "path": ["intents"]
+            },
+            "description": "Submits user intention to local Ollama (qwen2.5:3b) with schema validation and deterministic semantic fallback."
+          }
+        },
+        {
+          "name": "Synthesize Combinatorial Execution Plan",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"intentSessionId\": \"{{intentId}}\",\n  \"preferredTier\": \"balanced\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/plans",
+              "host": ["{{baseUrl}}"],
+              "path": ["plans"]
+            },
+            "description": "Computes 0/1 knapsack optimization across required categories enforcing hard budget ceiling."
+          }
+        }
+      ]
+    },
+    {
+      "name": "04. Cart Staging & Budget Guard",
+      "item": [
+        {
+          "name": "Sync Cart Line Items",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    { \"productId\": \"prod_kb_03\", \"quantity\": 1 },\n    { \"productId\": \"prod_mou_01\", \"quantity\": 1 },\n    { \"productId\": \"prod_acc_02\", \"quantity\": 1 },\n    { \"productId\": \"prod_hp_03\", \"quantity\": 1 }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/cart/sync",
+              "host": ["{{baseUrl}}"],
+              "path": ["cart", "sync"]
+            },
+            "description": "Syncs line items and recalculates totals using integer minor units (cents)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "05. PayPal Sandbox Orders v2",
+      "item": [
+        {
+          "name": "Create PayPal Sandbox Order (Valid Under-Budget)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cartId\": \"{{cartId}}\",\n  \"forceNew\": false\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/create-order",
+              "host": ["{{baseUrl}}"],
+              "path": ["payments", "create-order"]
+            },
+            "description": "Creates an official PayPal Orders v2 Sandbox order with server-authoritative DB pricing and idempotency."
+          }
+        },
+        {
+          "name": "Verify Over-Budget Rejection (Ceiling Defense)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cartId\": \"cart_over_budget_id\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/create-order",
+              "host": ["{{baseUrl}}"],
+              "path": ["payments", "create-order"]
+            },
+            "description": "Expects 400 BUDGET_CEILING_EXCEEDED when cart total exceeds user-defined hard budget."
+          }
+        },
+        {
+          "name": "Capture Approved PayPal Sandbox Order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paypalOrderId\": \"34652228W0460921K\",\n  \"orderId\": \"ord_demo_test\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/payments/capture-order",
+              "host": ["{{baseUrl}}"],
+              "path": ["payments", "capture-order"]
+            },
+            "description": "Performs server-side capture against PayPal Sandbox API after human buyer approval."
+          }
+        }
+      ]
+    },
+    {
+      "name": "06. Ledger & SHA-256 Snapshot Verification",
+      "item": [
+        {
+          "name": "Get Session Transaction History",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/transactions",
+              "host": ["{{baseUrl}}"],
+              "path": ["transactions"]
+            }
+          }
+        },
+        {
+          "name": "Verify SHA-256 Snapshot Hash",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-session-token",
+                "value": "{{sessionToken}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/transactions/{{transactionId}}/verify",
+              "host": ["{{baseUrl}}"],
+              "path": ["transactions", "{{transactionId}}", "verify"]
+            },
+            "description": "Reconstructs canonical transaction snapshot and verifies SHA-256 digest integrity."
+          }
+        }
+      ]
+    }
+  ]
+}

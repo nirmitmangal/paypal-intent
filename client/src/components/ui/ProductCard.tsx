@@ -77,7 +77,7 @@ export function ProductCard({
           <button
             onClick={() => onToggleLock(product)}
             className={cn(
-              'absolute top-2.5 right-2.5 p-1.5 rounded-lg backdrop-blur transition-all',
+              'absolute top-2.5 right-2.5 p-1.5 rounded-lg backdrop-blur transition-all cursor-pointer focus-ring',
               isLocked
                 ? 'bg-amber-500 text-white shadow-sm'
                 : 'bg-white/80 text-slate-600 hover:bg-white'

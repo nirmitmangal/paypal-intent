@@ -55,12 +55,12 @@ export function PlanningScreen() {
   };
 
   return (
-    <div className="space-y-6 max-w-4xl mx-auto py-4">
+    <div className="space-y-6 max-w-4xl mx-auto py-4 text-left">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-left">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
         <div>
           <Badge variant="info">Planning Interface</Badge>
-          <h2 className="text-xl font-bold text-slate-900 mt-1">Goal Decomposition & Task Breakdown</h2>
+          <h2 className="text-2xl font-bold text-slate-900 mt-1">Goal Decomposition & Task Breakdown</h2>
           <p className="text-xs text-slate-500">
             Customize category priorities and budget allocations before solver execution.
           </p>
@@ -80,7 +80,7 @@ export function PlanningScreen() {
             onClick={() => navigateTo('workspace')}
             leftIcon={<RotateCcw className="w-3.5 h-3.5" />}
           >
-            Reset
+            Back to Workspace
           </Button>
         </div>
       </div>
@@ -90,12 +90,13 @@ export function PlanningScreen() {
         {requirements.map((req) => {
           const estimatedCost = (totalCeiling * req.budgetShare) / 100;
           return (
-            <Card key={req.id} className="hover:border-slate-300 transition-colors">
+            <Card key={req.id} className="hover:border-slate-300 transition-all shadow-2xs">
               <CardContent className="p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                 <div className="space-y-1 text-left flex-1">
                   <div className="flex items-center gap-2">
                     <span className="font-bold text-sm text-slate-900">{req.name}</span>
                     <button
+                      type="button"
                       onClick={() => handleTogglePriority(req.id, req.priority)}
                       className="cursor-pointer"
                       title="Click to toggle priority"
@@ -118,11 +119,11 @@ export function PlanningScreen() {
                 </div>
 
                 {/* Budget Share Meter & Actions */}
-                <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end">
+                <div className="flex items-center gap-4 w-full sm:w-auto justify-between sm:justify-end shrink-0">
                   <div className="w-44 text-right space-y-1">
-                    <div className="flex justify-between text-xs">
+                    <div className="flex justify-between text-xs font-mono">
                       <span className="text-slate-400">Budget Share:</span>
-                      <span className="font-bold font-mono text-slate-800">
+                      <span className="font-bold text-slate-800">
                         {req.budgetShare}% (~{formatCurrency(estimatedCost)})
                       </span>
                     </div>
@@ -136,8 +137,9 @@ export function PlanningScreen() {
 
                   {requirements.length > 2 && (
                     <button
+                      type="button"
                       onClick={() => removeRequirement(req.id)}
-                      className="text-slate-400 hover:text-red-600 p-1.5 rounded-lg transition-colors"
+                      className="text-slate-400 hover:text-red-600 p-1.5 rounded-lg transition-colors cursor-pointer"
                       title="Remove category"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -151,7 +153,7 @@ export function PlanningScreen() {
       </div>
 
       {/* Footer Navigation */}
-      <div className="p-4 bg-white rounded-2xl border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 text-left">
+      <div className="p-4 bg-white rounded-2xl border border-slate-200/90 shadow-2xs flex flex-col sm:flex-row items-center justify-between gap-3 text-left">
         <span className="text-xs text-slate-500">
           Priorities and shares directly bound the knapsack solver to stay under ${totalCeiling}.
         </span>
@@ -165,7 +167,7 @@ export function PlanningScreen() {
             navigateTo('decision');
           }}
           rightIcon={<ArrowRight className="w-4 h-4" />}
-          className="bg-[#0070BA] hover:bg-[#005ea6] w-full sm:w-auto"
+          className="bg-[#0070BA] hover:bg-[#005ea6] text-white w-full sm:w-auto shadow-sm"
         >
           Generate Optimized Decision
         </Button>
@@ -180,23 +182,23 @@ export function PlanningScreen() {
       >
         <form onSubmit={handleAddSubmit} className="space-y-4 text-left">
           <div className="space-y-1">
-            <label className="text-xs font-semibold text-slate-700">Category Display Name:</label>
+            <label className="text-xs font-bold text-slate-700">Category Display Name:</label>
             <input
               type="text"
               required
               value={newCategoryName}
               onChange={(e) => setNewCategoryName(e.target.value)}
               placeholder="e.g., Ultra-Wide Monitor, Ergonomic Keyboard..."
-              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600"
+              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs text-slate-900 focus:bg-white focus:outline-none focus:border-[#0070BA]"
             />
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs font-semibold text-slate-700">Catalog Category Tag:</label>
+            <label className="text-xs font-bold text-slate-700">Catalog Category Tag:</label>
             <select
               value={newCategoryId}
               onChange={(e) => setNewCategoryId(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-semibold"
+              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs font-medium text-slate-800 focus:border-[#0070BA]"
             >
               <option value="monitors">Monitors & Displays</option>
               <option value="keyboards">Keyboards (Mechanical & Wireless)</option>
@@ -209,13 +211,13 @@ export function PlanningScreen() {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs font-semibold text-slate-700">Functional Requirement Description:</label>
+            <label className="text-xs font-bold text-slate-700">Functional Requirement Description:</label>
             <textarea
               rows={2}
               value={newDescription}
               onChange={(e) => setNewDescription(e.target.value)}
               placeholder="Explain the technical requirement for this category..."
-              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs text-slate-900 focus:bg-white focus:outline-none focus:border-blue-600 resize-none"
+              className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2.5 text-xs text-slate-900 focus:bg-white focus:outline-none focus:border-[#0070BA] resize-none"
             />
           </div>
 

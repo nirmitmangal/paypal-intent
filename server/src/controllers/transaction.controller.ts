@@ -56,4 +56,47 @@ export const transactionController = {
       });
     }
   },
+
+  verifyTransactionHash: (req: Request, res: Response): void => {
+    try {
+      const sessionId = (req as any).sessionId || 'ses_default';
+      const id = String(req.params.id);
+      const transaction = transactionService.getTransactionById(id);
+
+      if (!transaction) {
+        res.status(404).json({
+          success: false,
+          error: { code: 'TRANSACTION_NOT_FOUND', message: `Transaction ${id} not found` },
+        });
+        return;
+      }
+
+      if (transaction.sessionId && transaction.sessionId !== sessionId) {
+        res.status(403).json({
+          success: false,
+          error: { code: 'UNAUTHORIZED_ACCESS', message: 'Unauthorized: Transaction belongs to a different session' },
+        });
+        return;
+      }
+
+      const isValid = transactionService.verifyTransactionHash(transaction);
+
+      res.json({
+        success: true,
+        data: {
+          id: transaction.id,
+          isValid,
+          transactionHash: transaction.transactionHash,
+          algorithm: 'SHA-256',
+          canonicalPayload: `${transaction.orderId}:${transaction.paymentId}:${transaction.grossAmount}:${transaction.sessionId}:${(transaction.auditSnapshot as any)?.hashTimestamp || (transaction.auditSnapshot as any)?.timestamp}`,
+          verifiedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        error: { code: 'VERIFY_TRANSACTION_FAILED', message: (err as Error).message },
+      });
+    }
+  },
 };

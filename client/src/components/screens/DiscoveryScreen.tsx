@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import type { Product } from '@paypal-intent/shared';
 import { useApp } from '../../context/AppContext';
 import { ProductCard } from '../ui/ProductCard';
@@ -9,11 +9,12 @@ import { Badge } from '../ui/Badge';
 import { Modal } from '../ui/Modal';
 import { ProductCardSkeleton } from '../ui/LoadingSkeleton';
 import { formatCurrency } from '../../lib/utils';
-import { Search, ArrowRightLeft } from 'lucide-react';
+import { Search, ArrowRightLeft, PackageSearch } from 'lucide-react';
 
 export function DiscoveryScreen() {
   const {
     catalogProducts,
+    refreshCatalog,
     cartItems,
     addToCart,
     comparedProducts,
@@ -21,6 +22,12 @@ export function DiscoveryScreen() {
     clearCompare,
     isLoading,
   } = useApp();
+
+  useEffect(() => {
+    if (catalogProducts.length === 0) {
+      refreshCatalog();
+    }
+  }, [catalogProducts.length, refreshCatalog]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -31,7 +38,7 @@ export function DiscoveryScreen() {
   const cartProductIds = useMemo(() => cartItems.map((item) => item.product.id), [cartItems]);
 
   const categories = [
-    { id: 'all', label: 'All Catalog (23)' },
+    { id: 'all', label: 'All Catalog' },
     { id: 'laptops', label: 'Laptops' },
     { id: 'monitors', label: 'Monitors' },
     { id: 'keyboards', label: 'Keyboards' },
@@ -72,14 +79,17 @@ export function DiscoveryScreen() {
   }, [catalogProducts, selectedCategory, searchQuery, sortBy]);
 
   return (
-    <div className="space-y-6 max-w-6xl mx-auto py-4">
+    <div className="space-y-6 max-w-6xl mx-auto py-4 text-left">
       {/* Title & Toolbar */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-left">
-        <div>
-          <Badge variant="info">Curated Catalog</Badge>
-          <h2 className="text-2xl font-bold text-slate-900 mt-1">Product Discovery & Comparison</h2>
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <Badge variant="info">Curated Catalog</Badge>
+            <span className="text-[11px] text-slate-400 font-mono">{catalogProducts.length} Verified SKUs</span>
+          </div>
+          <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Product Discovery & Catalog</h2>
           <p className="text-xs text-slate-500">
-            Browse verified catalog inventory across 6 commerce domains with specifications and pricing.
+            Browse verified catalog inventory across 7 commerce categories with specifications and authoritative pricing.
           </p>
         </div>
 
@@ -89,7 +99,7 @@ export function DiscoveryScreen() {
             size="sm"
             onClick={() => setIsCompareModalOpen(true)}
             leftIcon={<ArrowRightLeft className="w-3.5 h-3.5" />}
-            className="bg-[#0070BA] animate-bounce"
+            className="bg-[#0070BA] text-white shadow-sm hover:shadow cursor-pointer"
           >
             Compare ({comparedProducts.length}) Items
           </Button>
@@ -97,23 +107,23 @@ export function DiscoveryScreen() {
       </div>
 
       {/* Filter & Search Bar */}
-      <div className="bg-white p-4 rounded-2xl border border-slate-200/90 shadow-sm space-y-3">
+      <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/90 shadow-2xs space-y-3.5">
         <div className="flex flex-col sm:flex-row items-center gap-3">
           <div className="w-full sm:flex-1">
             <Input
-              placeholder="Search by title, brand, or specification (e.g., dynamic, 40mm, VESA)..."
+              placeholder="Search by product title, brand, or specification (e.g., dynamic, 4K, ergonomic)..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              leftIcon={<Search className="w-4 h-4" />}
+              leftIcon={<Search className="w-4 h-4 text-slate-400" />}
             />
           </div>
 
-          <div className="flex items-center gap-2 w-full sm:w-auto">
-            <span className="text-xs text-slate-500 whitespace-nowrap">Sort by:</span>
+          <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
+            <span className="text-xs text-slate-500 font-medium whitespace-nowrap">Sort by:</span>
             <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as any)}
-              className="bg-slate-50 border border-slate-300 rounded-lg py-2 px-2.5 text-xs font-semibold text-slate-800"
+              className="bg-white border border-slate-300 rounded-lg py-2 px-3 text-xs font-semibold text-slate-800 focus:outline-none focus:border-[#0070BA] cursor-pointer"
             >
               <option value="featured">Featured / Recommended</option>
               <option value="price-asc">Price: Low to High</option>
@@ -124,14 +134,15 @@ export function DiscoveryScreen() {
         </div>
 
         {/* Category Pills */}
-        <div className="flex flex-wrap gap-1.5 pt-1 border-t border-slate-100">
+        <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-100">
           {categories.map((cat) => (
             <button
               key={cat.id}
+              type="button"
               onClick={() => setSelectedCategory(cat.id)}
-              className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-colors ${
+              className={`text-xs px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
                 selectedCategory === cat.id
-                  ? 'bg-blue-50 text-blue-700 font-semibold border border-blue-200'
+                  ? 'bg-blue-50 text-[#0070BA] border border-blue-200/80 shadow-2xs font-bold'
                   : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-slate-200/60'
               }`}
             >
@@ -149,8 +160,15 @@ export function DiscoveryScreen() {
           ))}
         </div>
       ) : filteredProducts.length === 0 ? (
-        <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center">
-          <p className="text-slate-500 text-sm">No products matched your search filter.</p>
+        <div className="bg-white rounded-2xl border border-slate-200 p-16 text-center space-y-3">
+          <PackageSearch className="w-10 h-10 text-slate-400 mx-auto" />
+          <h3 className="text-base font-bold text-slate-900">No matching products found</h3>
+          <p className="text-slate-500 text-xs max-w-sm mx-auto">
+            Try adjusting your search terms or select "All Catalog" to view available items.
+          </p>
+          <Button size="sm" variant="outline" onClick={() => { setSearchQuery(''); setSelectedCategory('all'); }}>
+            Reset Filters
+          </Button>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -158,7 +176,6 @@ export function DiscoveryScreen() {
             <div
               key={prod.id}
               onClick={(e) => {
-                // If not clicking button, open detail modal
                 if ((e.target as HTMLElement).closest('button')) return;
                 setDetailProduct(prod);
               }}
@@ -198,25 +215,25 @@ export function DiscoveryScreen() {
         <div className="space-y-4 text-left">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {comparedProducts.map((p) => (
-              <div key={p.id} className="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600">{p.brand}</span>
+              <div key={p.id} className="bg-white p-4 rounded-xl border border-slate-200/90 shadow-2xs space-y-3">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#0070BA]">{p.brand}</span>
                 <h4 className="font-bold text-xs text-slate-900 line-clamp-2">{p.title}</h4>
                 <div className="font-mono text-base font-bold text-slate-900">
                   {formatCurrency(p.basePrice, p.currency)}
                 </div>
 
-                <div className="space-y-1 pt-2 border-t border-slate-200 text-xs">
+                <div className="space-y-1 pt-2 border-t border-slate-100 text-xs">
                   <div className="flex justify-between">
                     <span className="text-slate-400">SKU:</span>
-                    <span className="font-mono font-medium">{p.sku}</span>
+                    <span className="font-mono font-medium text-slate-700">{p.sku}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-400">Rating:</span>
-                    <span className="font-semibold text-amber-600">★ {p.rating}</span>
+                    <span className="font-semibold text-amber-600">★ {p.rating.toFixed(1)}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-400">Reviews:</span>
-                    <span>{p.reviewCount}</span>
+                    <span className="text-slate-600">{p.reviewCount}</span>
                   </div>
                 </div>
 

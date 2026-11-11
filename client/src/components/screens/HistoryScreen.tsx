@@ -124,7 +124,10 @@ export function HistoryScreen() {
             </div>
 
             <div className="space-y-1 pt-2 border-t border-slate-100">
-              <span className="text-[11px] font-bold text-slate-400 uppercase">Cryptographic Audit Seal</span>
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-400 uppercase">SHA-256 Snapshot Hash</span>
+                <span className="text-[10px] text-emerald-600 font-semibold">✓ Verified Snapshot Digest</span>
+              </div>
               <div className="p-2 bg-slate-950 text-slate-300 font-mono text-[10px] rounded-lg break-all">
                 {selectedTx.transactionHash}
               </div>

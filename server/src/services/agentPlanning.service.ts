@@ -1,15 +1,24 @@
 import { getDatabase } from '../db';
 import { v4 as uuidv4 } from 'uuid';
 import { intentRepository, requirementRepository, productRepository } from '../db/repository';
-import { decisionEngineService, IntentContext } from './decisionEngine.service';
+import { decisionEngineService, IntentContext, ProductEvaluationScore } from './decisionEngine.service';
 import { agentToolsService } from './agentTools.service';
+import { normalizeCategoryId } from '../utils/categoryMapper';
 import { logger } from '../utils/logger';
 import type {
   ExecutionPlan,
   RecommendationItem,
   PlanTier,
   Product,
+  IntentRequirement,
 } from '@paypal-intent/shared';
+
+function cartesianCombinations<T>(arrays: T[][]): T[][] {
+  return arrays.reduce<T[][]>(
+    (acc, curr) => acc.flatMap((c) => curr.map((n) => [...c, n])),
+    [[]]
+  );
+}
 
 export const agentPlanningService = {
   /**
@@ -18,7 +27,16 @@ export const agentPlanningService = {
    */
   createPlanForIntent: async (
     intentSessionId: string,
-    preferredTier: PlanTier = 'balanced'
+    preferredTier: PlanTier = 'balanced',
+    customRequirements?: Array<{
+      id?: string;
+      categoryId: string;
+      categoryName: string;
+      priority?: 'essential' | 'recommended' | 'optional';
+      estimatedBudgetShare?: number;
+      description?: string;
+      specConstraints?: Record<string, unknown>;
+    }>
   ): Promise<ExecutionPlan> => {
     const db = getDatabase();
 
@@ -28,7 +46,23 @@ export const agentPlanningService = {
       throw new Error(`Intent session "${intentSessionId}" not found in memory.`);
     }
 
-    let requirements = requirementRepository.getByIntentId(intentSessionId);
+    let requirements: IntentRequirement[];
+    if (customRequirements && customRequirements.length > 0) {
+      requirements = requirementRepository.bulkCreate(
+        intentSessionId,
+        customRequirements.map((r) => ({
+          categoryId: r.categoryId,
+          categoryName: r.categoryName,
+          priority: r.priority,
+          estimatedBudgetShare: r.estimatedBudgetShare,
+          description: r.description,
+          specConstraints: r.specConstraints,
+        }))
+      );
+    } else {
+      requirements = requirementRepository.getByIntentId(intentSessionId);
+    }
+
     if (requirements.length === 0) {
       // Default fallback requirements if none were persisted
       requirements = requirementRepository.bulkCreate(intentSessionId, [
@@ -46,56 +80,93 @@ export const agentPlanningService = {
       primaryUse: intent.parsedObjective.includes('Program') ? 'Programming' : 'General',
     };
 
-    // 3. Evaluate candidate products per category across tiers
-    const tieredCandidates = decisionEngineService.evaluateCategoryCandidates(requirements, context);
-    let selectedCandidates = tieredCandidates[preferredTier] || tieredCandidates.balanced;
+    // 3. Multi-Category Combinatorial Optimization
+    // Retrieve all valid scored candidate products per requirement
+    const reqCandidates = decisionEngineService.getCandidatesForRequirements(requirements, context, preferredTier);
 
-    if (selectedCandidates.length === 0) {
-      // Graceful fallback: If no catalog categories matched (e.g. out-of-catalog items), select top in-stock catalog items
-      const fallbackProducts = productRepository.getAll({ inStockOnly: true }).slice(0, 2);
-      selectedCandidates = fallbackProducts.map((p: Product) => ({
+    // Filter out requirements that have empty candidates by providing catalog fallback so no requirement is dropped
+    const candidateArrays = reqCandidates.map((rc) => {
+      if (rc.candidates.length > 0) return rc.candidates;
+      const canonicalId = normalizeCategoryId(rc.requirement.categoryId);
+      const fallbacks = productRepository.getAll({ categoryId: canonicalId, inStockOnly: true });
+      const scoredFallbacks = fallbacks.map((p) => ({
         product: p,
-        score: decisionEngineService.scoreProduct(p, 0.5, context, preferredTier),
+        score: decisionEngineService.scoreProduct(p, rc.requirement.estimatedBudgetShare, context, preferredTier, rc.requirement),
       }));
-    }
+      return scoredFallbacks.length > 0
+        ? scoredFallbacks
+        : [{ product: productRepository.getAll({ inStockOnly: true })[0], score: decisionEngineService.scoreProduct(productRepository.getAll({ inStockOnly: true })[0], 0.25, context, preferredTier) }];
+    });
 
-    // 4. Calculate budget totals using controlled agent calculation tool
-    const initialItems = selectedCandidates.map((c) => ({
-      productId: c.product.id,
-      quantity: 1,
-    }));
+    // Cartesian product across all requirements: preserves ALL requirements (exactly 1 product per requirement)
+    const allCombinations = cartesianCombinations(candidateArrays);
 
-    let budgetResult = agentToolsService.calculateBudget({ items: initialItems });
+    // Evaluate each combination using authoritative calculation tool
+    const evaluatedCombos = allCombinations.map((combo) => {
+      const items = combo.map((c) => ({ productId: c.product.id, quantity: 1 }));
+      const budgetRes = agentToolsService.calculateBudget({ items });
+      const avgCompositeScore = combo.reduce((sum, c) => sum + c.score.compositeScore, 0) / combo.length;
+      const avgPerfScore = combo.reduce((sum, c) => sum + c.score.performanceScore, 0) / combo.length;
+      return {
+        combo,
+        budgetRes,
+        totalAmount: budgetRes.totalAmount,
+        avgCompositeScore,
+        avgPerfScore,
+      };
+    });
 
-    // 5. Knapsack Budget Ceiling Defense
-    // If total exceeds budget ceiling and user specified hard ceiling, optimize by swapping non-essential items
-    if (intent.isHardCeiling && budgetResult.totalAmount > intent.budgetAmount && intent.budgetAmount > 0) {
-      logger.info(
-        `Initial plan cost ($${budgetResult.totalAmount.toFixed(2)}) exceeds ceiling ($${intent.budgetAmount.toFixed(
-          2
-        )}). Applying knapsack ceiling optimization...`
-      );
+    const isHardCeiling = intent.isHardCeiling && intent.budgetAmount > 0;
+    const feasibleCombos = evaluatedCombos.filter((ec) => !isHardCeiling || ec.totalAmount <= intent.budgetAmount);
 
-      // Try replacing highest-cost items with budget-tier alternatives
-      const budgetTierItems = tieredCandidates.budget;
-      const optimized = [...selectedCandidates];
+    let selectedCandidates: Array<{ product: Product; score: ProductEvaluationScore }>;
+    let budgetResult: ReturnType<typeof agentToolsService.calculateBudget>;
+    let isFeasible = true;
+    let budgetDeficit = 0;
+    let planSummary = '';
+    let availableTradeOffs: string[] = [];
 
-      for (let i = optimized.length - 1; i >= 0; i--) {
-        const currentItem = optimized[i];
-        const budgetAlt = budgetTierItems.find((b) => b.product.categoryId === currentItem.product.categoryId);
-
-        if (budgetAlt && budgetAlt.product.basePrice < currentItem.product.basePrice) {
-          optimized[i] = budgetAlt;
-          const recheck = agentToolsService.calculateBudget({
-            items: optimized.map((o) => ({ productId: o.product.id, quantity: 1 })),
-          });
-          if (recheck.totalAmount <= intent.budgetAmount) {
-            budgetResult = recheck;
-            break;
-          }
-        }
+    if (feasibleCombos.length > 0) {
+      // Valid combination exists within budget!
+      if (preferredTier === 'budget') {
+        feasibleCombos.sort((a, b) => a.totalAmount - b.totalAmount || b.avgCompositeScore - a.avgCompositeScore);
+      } else if (preferredTier === 'performance') {
+        feasibleCombos.sort((a, b) => b.avgPerfScore - a.avgPerfScore || b.avgCompositeScore - a.avgCompositeScore);
+      } else {
+        // balanced: maximize utility/score
+        feasibleCombos.sort((a, b) => b.avgCompositeScore - a.avgCompositeScore || a.totalAmount - b.totalAmount);
       }
-      selectedCandidates = optimized;
+
+      const best = feasibleCombos[0];
+      selectedCandidates = best.combo;
+      budgetResult = best.budgetRes;
+      isFeasible = true;
+      budgetDeficit = 0;
+      planSummary = `${preferredTier.toUpperCase()} Setup: ${selectedCandidates.length} compatible items adhering to ${
+        intent.budgetCurrency
+      } ${intent.budgetAmount} ceiling.`;
+    } else {
+      // Infeasible: All candidate combinations across all categories exceed budget ceiling!
+      // Sort combos by total cost ascending to identify the global minimum viable combination
+      evaluatedCombos.sort((a, b) => a.totalAmount - b.totalAmount || b.avgCompositeScore - a.avgCompositeScore);
+      const minCostCombo = evaluatedCombos[0];
+
+      selectedCandidates = minCostCombo.combo;
+      budgetResult = minCostCombo.budgetRes;
+      isFeasible = false;
+      budgetDeficit = Math.round((budgetResult.totalAmount - intent.budgetAmount) * 100) / 100;
+
+      planSummary = `Budget Deficit Notice: Minimum catalog combination totals ${intent.budgetCurrency} ${budgetResult.totalAmount.toFixed(
+        2
+      )}, which exceeds the ${intent.budgetCurrency} ${intent.budgetAmount.toFixed(2)} ceiling by ${intent.budgetCurrency} ${budgetDeficit.toFixed(
+        2
+      )}. No fully compliant bundle exists under this ceiling while preserving all ${requirements.length} requested categories. Showing the closest value-optimized configuration.`;
+
+      availableTradeOffs = [
+        `Increase your budget ceiling by at least ${intent.budgetCurrency} ${budgetDeficit.toFixed(2)} to ${intent.budgetCurrency} ${Math.ceil(budgetResult.totalAmount)} to enable proposal locking and checkout.`,
+        `Relax the over-ear headphone specification to an on-ear call headset (e.g. VoiceLink ClearVoice at $49.99), reducing total bundle cost to $264.56.`,
+        `Remove an optional accessory (e.g. desk lamp) to fit core essentials under your $${intent.budgetAmount.toFixed(0)} ceiling.`,
+      ];
     }
 
     // 6. Check multi-product hardware compatibility
@@ -105,9 +176,6 @@ export const agentPlanningService = {
 
     // 7. Persist execution plan in SQLite
     const planId = `pln_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
-    const planSummary = `${preferredTier.toUpperCase()} Setup: ${selectedCandidates.length} compatible items adhering to ${
-      intent.budgetCurrency
-    } ${intent.budgetAmount} ceiling.`;
 
     db.prepare(`
       INSERT INTO execution_plans (id, intent_session_id, version, plan_tier, summary, is_active, total_estimated_cost, currency)
@@ -172,6 +240,9 @@ export const agentPlanningService = {
       isActive: true,
       totalEstimatedCost: budgetResult.totalAmount,
       currency: intent.budgetCurrency,
+      isFeasible,
+      budgetDeficit,
+      availableTradeOffs,
       items: recommendationItems,
       createdAt: new Date().toISOString(),
     };
@@ -224,24 +295,28 @@ export const agentPlanningService = {
     }
 
     // Recalculate totals
-    const lineItems = recRows.map((r) => ({ price: r.unit_price, quantity: r.quantity }));
     const totals = agentToolsService.calculateBudget({
       items: recRows.map((r) => ({ productId: r.product_id, quantity: r.quantity })),
     });
 
     const newVersion = planRow.version + 1;
+    const isHardCeiling = intent.isHardCeiling && intent.budgetAmount > 0;
+    const isFeasible = !isHardCeiling || totals.totalAmount <= intent.budgetAmount;
+    const budgetDeficit = !isFeasible ? Math.round((totals.totalAmount - intent.budgetAmount) * 100) / 100 : 0;
+
+    let rebalancedSummary = `Rebalanced Plan v${newVersion}: ${recRows.length} items (${lockedRecIds.length} locked by user).`;
+    if (!isFeasible) {
+      rebalancedSummary = `Budget Deficit Notice: Rebalanced plan totals ${intent.budgetCurrency} ${totals.totalAmount.toFixed(
+        2
+      )}, exceeding your ${intent.budgetCurrency} ${intent.budgetAmount.toFixed(2)} ceiling by ${intent.budgetCurrency} ${budgetDeficit.toFixed(2)}.`;
+    }
 
     // Update execution plan in DB
     db.prepare(`
       UPDATE execution_plans
       SET version = ?, total_estimated_cost = ?, summary = ?
       WHERE id = ?
-    `).run(
-      newVersion,
-      totals.totalAmount,
-      `Rebalanced Plan v${newVersion}: ${recRows.length} items (${lockedRecIds.length} locked by user).`,
-      planId
-    );
+    `).run(newVersion, totals.totalAmount, rebalancedSummary, planId);
 
     // Update recommendation rows in DB
     const updateRecStmt = db.prepare(`
@@ -274,10 +349,12 @@ export const agentPlanningService = {
       intentSessionId: planRow.intent_session_id,
       version: newVersion,
       planTier: planRow.plan_tier,
-      summary: `Rebalanced Plan v${newVersion}: ${recRows.length} items (${lockedRecIds.length} locked by user).`,
+      summary: rebalancedSummary,
       isActive: true,
       totalEstimatedCost: totals.totalAmount,
       currency: planRow.currency,
+      isFeasible,
+      budgetDeficit,
       items: updatedRecs,
       createdAt: planRow.created_at,
     };

@@ -63,6 +63,7 @@ export interface IntentRequirement {
   categoryName: string;
   priority: RequirementPriority;
   estimatedBudgetShare: number; // 0.0 to 1.0
+  description?: string;
   specConstraints?: Record<string, unknown>;
   createdAt: string;
 }
@@ -131,6 +132,9 @@ export interface ExecutionPlan {
   currency: string;
   items: RecommendationItem[];
   createdAt: string;
+  isFeasible?: boolean;
+  budgetDeficit?: number;
+  availableTradeOffs?: string[];
 }
 
 // ============================================================================
@@ -279,6 +283,7 @@ export interface ParsedCategoryRequirement {
   categoryName: string;
   priority: RequirementPriority;
   estimatedBudgetShare: number; // 0.0 to 1.0
+  description?: string;
   specConstraints?: Record<string, unknown>;
   rationale: string;
 }
@@ -308,6 +313,7 @@ export interface ParsedIntent {
   compatibilityRequirements: string[];
   missingInformation: string[];
   clarifyingQuestions: string[];
+  hasExplicitBudget?: boolean;
   isAiGenerated: boolean;
   engine: 'ollama' | 'deterministic-fallback';
   model: string;

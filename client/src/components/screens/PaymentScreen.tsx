@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { PayPalScriptProvider, PayPalButtons } from '@paypal/react-paypal-js';
 import type { TransactionRecord } from '@paypal-intent/shared';
 import { useApp } from '../../context/AppContext';
@@ -50,80 +50,188 @@ export function PaymentScreen() {
   const [validationResult, setValidationResult] = useState<any | null>(null);
 
   const serverOrderIdRef = useRef<string | null>(null);
+  const inFlightCreateOrderRef = useRef<Promise<string> | null>(null);
+  const cachedPayPalOrderIdRef = useRef<string | null>(null);
 
   const subtotal = cartItems.reduce((acc, item) => acc + item.product.basePrice * item.quantity, 0);
   const estimatedTax = Math.round(subtotal * 0.08 * 100) / 100;
   const grandTotal = Math.round((subtotal + estimatedTax) * 100) / 100;
 
-  // Initialize and synchronize backend state
+  const isHardCeiling = currentIntent?.isHardCeiling ?? true;
+  const budgetCeiling = currentIntent?.budgetAmount || 350;
+  const isOverBudget = Boolean(isHardCeiling && grandTotal > budgetCeiling);
+  const shortfall = isOverBudget ? Math.round((grandTotal - budgetCeiling) * 100) / 100 : 0;
+
+  // Memoize PayPal SDK configuration options to guarantee absolute reference stability.
+  // Re-creating options causes @paypal/react-paypal-js to reload the SDK script and tear down
+  // the popup window's postMessage communication channel, triggering "Things don't appear to be working".
+  const scriptOptions = useMemo(() => {
+    if (!payPalConfig?.clientId || payPalConfig.clientId === 'sandbox_client_id_placeholder') {
+      return null;
+    }
+    return {
+      clientId: payPalConfig.clientId,
+      currency: 'USD',
+      intent: 'capture',
+      components: 'buttons',
+    };
+  }, [payPalConfig?.clientId]);
+
+  // Reset cached order when cart contents change
+  useEffect(() => {
+    cachedPayPalOrderIdRef.current = null;
+    inFlightCreateOrderRef.current = null;
+  }, [cartItems]);
+
+  // Handle return from PayPal redirect fallback flow (if popup redirects window)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get('token');
+    const status = params.get('status');
+
+    if (status === 'cancelled') {
+      handleCancel();
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return;
+    }
+
+    if (token && (status === 'approved' || params.has('PayerID')) && paymentState === 'ready') {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      handleApprove({ orderID: token });
+    }
+  }, []);
+
+  // 1. Fetch public PayPal configuration once on mount (never exposes secrets; guarantees reference stability)
   useEffect(() => {
     let isMounted = true;
-
-    async function initGateway() {
-      try {
-        setIsLoadingConfig(true);
-
-        // 1. Fetch public PayPal configuration (never exposes secrets)
-        const cfgRes = await api.getPayPalConfig();
+    api
+      .getPayPalConfig()
+      .then((cfgRes) => {
         if (isMounted && cfgRes.success && cfgRes.data) {
           setPayPalConfig(cfgRes.data);
         }
+      })
+      .catch((err) => {
+        console.error('Failed to load PayPal config:', err);
+      })
+      .finally(() => {
+        if (isMounted) {
+          setIsLoadingConfig(false);
+        }
+      });
 
-        // 2. Fetch & sync server cart
-        await syncCartToServer();
-        const cartRes = await api.getCart(currentIntent?.id);
-        if (isMounted && cartRes.success && cartRes.data) {
-          setActiveServerCartId(cartRes.data.id);
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // 2. Synchronize active cart with backend whenever cart items or intent change
+  useEffect(() => {
+    let isMounted = true;
+
+    async function syncActiveCart() {
+      try {
+        const synced = await syncCartToServer();
+        if (isMounted && synced?.id) {
+          setActiveServerCartId(synced.id);
+        } else {
+          const cartRes = await api.getCart(currentIntent?.id);
+          if (isMounted && cartRes.success && cartRes.data?.id) {
+            setActiveServerCartId(cartRes.data.id);
+          }
         }
       } catch (err: any) {
         if (isMounted) {
-          console.error('Failed to initialize PayPal Gateway:', err);
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoadingConfig(false);
+          console.error('Failed to synchronize cart with server:', err);
         }
       }
     }
 
-    initGateway();
+    if (cartItems.length > 0) {
+      syncActiveCart();
+    }
 
     return () => {
       isMounted = false;
     };
   }, [currentIntent?.id, cartItems]);
 
-  // PayPal JavaScript SDK Order Creation
+  // PayPal JavaScript SDK Order Creation with idempotency and in-flight deduplication
   const handleCreateOrder = async (): Promise<string> => {
     try {
-      setPaymentState('creating_order');
       setErrorMessage(null);
 
-      let cartId = activeServerCartId;
-      if (!cartId) {
-        const cartRes = await api.getCart(currentIntent?.id);
-        cartId = cartRes.data?.id || '';
-        setActiveServerCartId(cartId);
+      if (isOverBudget) {
+        const msg = `Checkout blocked: Order total ($${grandTotal}) exceeds hard budget ceiling ($${budgetCeiling}) by $${shortfall}`;
+        setPaymentState('failed');
+        setErrorMessage(msg);
+        showNotification(msg, 'error');
+        throw new Error(msg);
       }
 
-      if (!cartId) {
-        throw new Error('Active shopping cart not found on the server.');
+      // Reuse already created PayPal order if still pending and cart unchanged
+      if (cachedPayPalOrderIdRef.current && paymentState !== 'failed') {
+        setPaymentState('authorizing');
+        return cachedPayPalOrderIdRef.current;
       }
 
-      // Call server to create an official PayPal Sandbox order with authoritative DB pricing
-      const res = await api.createPayPalOrder(cartId);
-      if (!res.success || !res.data) {
-        throw new Error(res.error?.message || 'Failed to create PayPal Sandbox order');
+      // Reuse in-flight creation promise if rapid clicks occur
+      if (inFlightCreateOrderRef.current) {
+        return inFlightCreateOrderRef.current;
       }
 
-      serverOrderIdRef.current = res.data.orderId;
-      setPaymentState('authorizing');
-      return res.data.paypalOrderId;
+      const createPromise = (async () => {
+        setPaymentState('creating_order');
+
+        let cartId = activeServerCartId;
+        if (!cartId) {
+          // If activeServerCartId not yet populated, sync authoritative cart directly
+          const synced = await syncCartToServer();
+          if (synced?.id) {
+            cartId = synced.id;
+            setActiveServerCartId(cartId);
+          } else {
+            const cartRes = await api.getCart(currentIntent?.id);
+            cartId = cartRes.data?.id || '';
+            if (cartId) setActiveServerCartId(cartId);
+          }
+        }
+
+        if (!cartId) {
+          throw new Error('Active shopping cart not found on the server.');
+        }
+
+        // Call backend to create or reuse an official PayPal Sandbox order with authoritative DB pricing
+        const res = await api.createPayPalOrder(cartId);
+        if (!res.success || !res.data) {
+          throw new Error(res.error?.message || 'Failed to create PayPal Sandbox order');
+        }
+
+        serverOrderIdRef.current = res.data.orderId;
+        try {
+          sessionStorage.setItem('paypal_pending_server_order_id', res.data.orderId);
+          sessionStorage.setItem('paypal_pending_paypal_order_id', res.data.paypalOrderId);
+        } catch {
+          // ignore session storage access error
+        }
+
+        cachedPayPalOrderIdRef.current = res.data.paypalOrderId;
+        setPaymentState('authorizing');
+        return res.data.paypalOrderId;
+      })();
+
+      inFlightCreateOrderRef.current = createPromise;
+      try {
+        return await createPromise;
+      } finally {
+        inFlightCreateOrderRef.current = null;
+      }
     } catch (err: any) {
       setPaymentState('failed');
       const msg = err.message || 'Failed to create PayPal Sandbox order.';
       setErrorMessage(msg);
       showNotification(msg, 'error');
+      cachedPayPalOrderIdRef.current = null;
       throw err;
     }
   };
@@ -132,15 +240,30 @@ export function PaymentScreen() {
   const handleApprove = async (data: { orderID: string }): Promise<void> => {
     try {
       setPaymentState('capturing');
-      const serverOrderId = serverOrderIdRef.current;
+      let serverOrderId = serverOrderIdRef.current;
       if (!serverOrderId) {
-        throw new Error('Internal server order reference missing.');
+        try {
+          serverOrderId = sessionStorage.getItem('paypal_pending_server_order_id');
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!serverOrderId) {
+        throw new Error('Internal server order reference missing. Please try again.');
       }
 
       // Call backend to perform genuine server-side capture against PayPal Sandbox
       const res = await api.capturePayPalOrder(data.orderID, serverOrderId);
       if (!res.success || !res.data) {
         throw new Error(res.error?.message || 'Payment capture failed on server.');
+      }
+
+      try {
+        sessionStorage.removeItem('paypal_pending_server_order_id');
+        sessionStorage.removeItem('paypal_pending_paypal_order_id');
+      } catch {
+        // ignore
       }
 
       setPaymentState('success');
@@ -164,12 +287,14 @@ export function PaymentScreen() {
   // PayPal JavaScript SDK Cancel Handler
   const handleCancel = (): void => {
     setPaymentState('ready');
+    cachedPayPalOrderIdRef.current = null;
     showNotification('PayPal transaction cancelled by buyer. Your cart was preserved.', 'info');
   };
 
   // PayPal JavaScript SDK Error Handler
   const handleError = (err: any): void => {
     setPaymentState('failed');
+    cachedPayPalOrderIdRef.current = null;
     const msg = err?.message || 'PayPal Sandbox encountered an error during checkout.';
     setErrorMessage(msg);
     showNotification(msg, 'error');
@@ -269,6 +394,37 @@ export function PaymentScreen() {
             </div>
           </div>
 
+          {/* Hard Ceiling Deficit Alert */}
+          {isOverBudget && (
+            <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-red-950 text-xs space-y-3 text-left">
+              <div className="flex items-center gap-2 font-bold text-red-900">
+                <AlertCircle className="w-5 h-5 text-red-600 shrink-0" />
+                <span>Checkout Blocked: Hard Budget Ceiling Exceeded (+{formatCurrency(shortfall)})</span>
+              </div>
+              <p className="text-red-800 leading-relaxed">
+                Your order total of <strong>{formatCurrency(grandTotal)}</strong> exceeds your hard budget ceiling of <strong>${budgetCeiling}</strong>.
+                The PayPal Intent agent and backend payment service strictly prohibit authorizing transactions that violate the user's hard budget limit.
+              </p>
+              <div className="pt-2 flex flex-col sm:flex-row gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => navigateTo('decision')}
+                  className="bg-[#0070BA] hover:bg-[#005ea6] text-white"
+                >
+                  Return to Decision Studio
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => navigateTo('cart')}
+                  className="border-slate-300"
+                >
+                  Adjust Cart
+                </Button>
+              </div>
+            </div>
+          )}
+
           {/* Configuration Loading State */}
           {isLoadingConfig && (
             <div className="py-8 text-center space-y-2">
@@ -278,7 +434,7 @@ export function PaymentScreen() {
           )}
 
           {/* Live Official PayPal Buttons when Configured */}
-          {!isLoadingConfig && payPalConfig?.isConfigured && paymentState !== 'success' && (
+          {!isLoadingConfig && !isOverBudget && payPalConfig?.isConfigured && paymentState !== 'success' && (
             <div className="space-y-4 pt-2">
               <div className="flex items-center justify-between text-xs text-slate-500 border-b pb-2">
                 <span className="flex items-center gap-1.5 text-emerald-700 font-medium">
@@ -290,29 +446,24 @@ export function PaymentScreen() {
                 </span>
               </div>
 
-              <PayPalScriptProvider
-                options={{
-                  clientId: payPalConfig.clientId,
-                  currency: 'USD',
-                  intent: 'capture',
-                  components: 'buttons',
-                }}
-              >
-                <div className="min-h-[50px]">
-                  <PayPalButtons
-                    style={{
-                      layout: 'vertical',
-                      color: 'gold',
-                      shape: 'rect',
-                      label: 'paypal',
-                    }}
-                    createOrder={handleCreateOrder}
-                    onApprove={handleApprove}
-                    onCancel={handleCancel}
-                    onError={handleError}
-                  />
-                </div>
-              </PayPalScriptProvider>
+              {scriptOptions && (
+                <PayPalScriptProvider options={scriptOptions}>
+                  <div className="min-h-[50px]">
+                    <PayPalButtons
+                      style={{
+                        layout: 'vertical',
+                        color: 'gold',
+                        shape: 'rect',
+                        label: 'paypal',
+                      }}
+                      createOrder={handleCreateOrder}
+                      onApprove={handleApprove}
+                      onCancel={handleCancel}
+                      onError={handleError}
+                    />
+                  </div>
+                </PayPalScriptProvider>
+              )}
 
               <Button
                 variant="ghost"
@@ -326,7 +477,7 @@ export function PaymentScreen() {
           )}
 
           {/* Sandbox Credentials Setup Guide for Judges when Not Yet Configured */}
-          {!isLoadingConfig && !payPalConfig?.isConfigured && paymentState !== 'success' && (
+          {!isLoadingConfig && !isOverBudget && !payPalConfig?.isConfigured && paymentState !== 'success' && (
             <div className="space-y-4 text-left">
               <div className="p-4 rounded-xl bg-blue-50/70 border border-blue-200 text-blue-950 text-xs space-y-3">
                 <div className="flex items-center gap-2 font-bold text-blue-900">
@@ -446,7 +597,7 @@ export function PaymentScreen() {
                   <span className="font-bold text-slate-800">{formatCurrency(capturedTx.grossAmount)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-slate-500">SHA-256 Audit Seal:</span>
+                  <span className="text-slate-500">SHA-256 Snapshot Hash:</span>
                   <span className="text-[10px] truncate max-w-[220px] text-slate-600">
                     {capturedTx.transactionHash}
                   </span>
@@ -471,7 +622,15 @@ export function PaymentScreen() {
                 <h4 className="text-base font-bold text-red-900">Payment Unsuccessful</h4>
                 <p className="text-xs text-red-700">{errorMessage || 'Unable to complete PayPal transaction.'}</p>
               </div>
-              <Button size="sm" variant="outline" onClick={() => setPaymentState('ready')}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  cachedPayPalOrderIdRef.current = null;
+                  setErrorMessage(null);
+                  setPaymentState('ready');
+                }}
+              >
                 <RefreshCw className="w-3.5 h-3.5 mr-1" />
                 Try Again
               </Button>
